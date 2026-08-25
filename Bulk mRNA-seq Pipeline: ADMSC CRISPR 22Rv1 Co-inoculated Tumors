@@ -1,0 +1,2206 @@
+#!/usr/bin/env Rscript
+# ============================================================================
+# Bulk mRNA-seq Pipeline: ADMSC CRISPR 22Rv1 Co-inoculated Tumors
+# ============================================================================
+# Experiment:
+#   - SC      : sgScramble KO ADMSC + 22Rv1 (control)
+#   - sgT     : sgTNFSF12 KO ADMSC + 22Rv1
+#   - sgM     : sgMDK KO ADMSC + 22Rv1
+#   - sgT-sgM : sgTNFSF12+sgMDK dual KO ADMSC + 22Rv1
+#
+# Each group has 3 biological replicates, paired-end sequencing (R1/R2)
+#
+# DESIGN NOTES:
+#   - ALL processing happens on external drive: /Volumes/Jingjing Chen/...
+#   - Final results are COPIED to iCloud at the end.
+#   - Rsubread needs space-free paths; symlinks in /tmp redirect there.
+#
+# GSEA NOTE:
+#   - Step 9 uses full MSigDB (H, C2, C5, C6, optionally C7) + custom signatures.
+#   - Results organized per-collection.
+# ============================================================================
+
+
+# ============================================================
+# 0. CONFIGURATION
+# ============================================================
+
+cat("=============================================================\n")
+cat("  Bulk mRNA-seq Pipeline: ADMSC CRISPR x 22Rv1 Tumors\n")
+cat("=============================================================\n\n")
+
+EXTERNAL_BASE <- "/Volumes/Jingjing Chen/Bulk mRNA seq ADMSC Crispr 22Rv1 tumor"
+FASTQ_DIR     <- file.path(EXTERNAL_BASE, "00_fastq")
+
+WORK_DIR     <- file.path(EXTERNAL_BASE, "processing")
+ALIGN_DIR    <- file.path(WORK_DIR, "01_alignment")
+COUNTS_DIR   <- file.path(WORK_DIR, "02_counts")
+DE_DIR       <- file.path(WORK_DIR, "03_DEG")
+CELLCHAT_DIR <- file.path(WORK_DIR, "04_CellChat_receptors")
+GSEA_DIR     <- file.path(WORK_DIR, "05_GSEA_Hallmarks")
+QC_DIR       <- file.path(WORK_DIR, "06_QC")
+
+OUTPUT_DIR <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Bulk mRNA seq ADMSC Crispr 22Rv1 tumor"
+
+dirs_to_create <- c(WORK_DIR, ALIGN_DIR, COUNTS_DIR, DE_DIR,
+                     CELLCHAT_DIR, GSEA_DIR, QC_DIR)
+invisible(lapply(dirs_to_create, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+REF_DIR      <- file.path(EXTERNAL_BASE, "reference")
+GENOME_FASTA <- file.path(REF_DIR, "GRCh38.primary_assembly.genome.fa")
+GTF_FILE     <- file.path(REF_DIR, "gencode.v44.primary_assembly.annotation.gtf")
+INDEX_DIR    <- file.path(REF_DIR, "Rsubread_index")
+dir.create(INDEX_DIR, recursive = TRUE, showWarnings = FALSE)
+
+create_safe_symlink <- function() {
+  dir.create("/tmp/rsubread_work", showWarnings = FALSE, recursive = TRUE)
+  symlink <- "/tmp/rsubread_work/ext"
+  if (file.exists(symlink)) unlink(symlink)
+  file.symlink(EXTERNAL_BASE, symlink)
+  return(symlink)
+}
+
+SYMLINK_BASE <- "/tmp/rsubread_work"
+SYMLINK_EXT  <- create_safe_symlink()
+
+SAFE_FASTQ_DIR    <- file.path(SYMLINK_EXT, "00_fastq")
+SAFE_ALIGN_DIR    <- file.path(SYMLINK_EXT, "processing", "01_alignment")
+SAFE_COUNTS_DIR   <- file.path(SYMLINK_EXT, "processing", "02_counts")
+SAFE_REF_DIR      <- file.path(SYMLINK_EXT, "reference")
+SAFE_INDEX_PREFIX <- file.path(SAFE_REF_DIR, "Rsubread_index", "GRCh38")
+SAFE_GTF_FILE     <- file.path(SAFE_REF_DIR, "gencode.v44.primary_assembly.annotation.gtf")
+SAFE_GENOME_FASTA <- file.path(SAFE_REF_DIR, "GRCh38.primary_assembly.genome.fa")
+
+dir.create(SAFE_ALIGN_DIR, recursive = TRUE, showWarnings = FALSE)
+
+N_THREADS   <- 8
+PADJ_CUTOFF <- 0.05
+LFC_CUTOFF  <- 0
+
+MSIGDB_USE_C2 <- TRUE
+MSIGDB_USE_C5 <- TRUE
+MSIGDB_USE_C6 <- TRUE
+MSIGDB_USE_C7 <- FALSE
+
+GROUP_INFO <- data.frame(
+  group       = c("SC", "sgT", "sgM", "sgT-sgM"),
+  folder      = c("SC", "sgT", "sgM", "sgT-sgM"),
+  description = c("sgScramble KO ADMSC + 22Rv1 (Control)",
+                   "sgTNFSF12 KO ADMSC + 22Rv1",
+                   "sgMDK KO ADMSC + 22Rv1",
+                   "sgTNFSF12+sgMDK dual KO ADMSC + 22Rv1"),
+  knockout = c("Scramble", "TNFSF12", "MDK", "TNFSF12+MDK"),
+  stringsAsFactors = FALSE)
+
+SAMPLE_INFO <- data.frame(
+  sample_name = c("SC-1","SC-2","SC-3","sgT-1","sgT-2","sgT-3",
+                   "sgM-1","sgM-2","sgM-3","sgT-sgM-1","sgT-sgM-2","sgT-sgM-3"),
+  group   = c(rep("SC",3), rep("sgT",3), rep("sgM",3), rep("sgT-sgM",3)),
+  folder  = c(rep("SC",3), rep("sgT",3), rep("sgM",3), rep("sgT-sgM",3)),
+  replicate = rep(1:3, 4), stringsAsFactors = FALSE)
+
+cat("   === Path Verification ===\n")
+cat(sprintf("   External drive      : %s  [exists: %s]\n", EXTERNAL_BASE, dir.exists(EXTERNAL_BASE)))
+cat(sprintf("   FASTQ directory     : %s  [exists: %s]\n", FASTQ_DIR, dir.exists(FASTQ_DIR)))
+cat(sprintf("   Working directory   : %s\n", WORK_DIR))
+cat(sprintf("   Genome FASTA        : [exists: %s]\n", file.exists(GENOME_FASTA)))
+cat(sprintf("   GTF annotation      : [exists: %s]\n", file.exists(GTF_FILE)))
+cat(sprintf("   Symlink             : %s -> %s\n", SYMLINK_EXT, EXTERNAL_BASE))
+cat(sprintf("   MSigDB: C2=%s C5=%s C6=%s C7=%s\n\n",
+            MSIGDB_USE_C2, MSIGDB_USE_C5, MSIGDB_USE_C6, MSIGDB_USE_C7))
+
+setwd(WORK_DIR)
+
+
+# ============================================================
+# 1. INSTALL / LOAD PACKAGES
+# ============================================================
+
+cat(">> Step 1: Loading required packages...\n")
+
+EXT_LIB <- file.path(EXTERNAL_BASE, "R_library")
+dir.create(EXT_LIB, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(EXT_LIB, .libPaths()))
+
+required_bioc <- c("Rsubread","Rsamtools","DESeq2","clusterProfiler",
+                    "enrichplot","org.Hs.eg.db","msigdbr","fgsea")
+required_cran <- c("ggplot2","pheatmap","RColorBrewer","ggrepel",
+                    "reshape2","dplyr","tidyr","tools","openxlsx")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager", lib = EXT_LIB)
+for (pkg in required_bioc)
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg, lib = EXT_LIB, ask = FALSE, update = FALSE)
+for (pkg in required_cran)
+  if (!requireNamespace(pkg, quietly = TRUE))
+    install.packages(pkg, lib = EXT_LIB, repos = "https://cloud.r-project.org")
+if (!requireNamespace("CellChat", quietly = TRUE)) {
+  if (!requireNamespace("devtools", quietly = TRUE))
+    install.packages("devtools", lib = EXT_LIB)
+  withr::with_libpaths(EXT_LIB, devtools::install_github("jinworks/CellChat"))
+}
+
+library(Rsubread); library(Rsamtools); library(DESeq2)
+library(clusterProfiler); library(enrichplot); library(org.Hs.eg.db)
+library(msigdbr); library(fgsea); library(CellChat)
+library(ggplot2); library(pheatmap); library(RColorBrewer)
+library(ggrepel); library(reshape2); library(dplyr); library(tidyr); library(openxlsx)
+
+cat("   All packages loaded.\n\n")
+
+
+# ============================================================
+# 2. SCAN AND VALIDATE FASTQ FILES
+# ============================================================
+
+cat(">> Step 2: Scanning FASTQ directory...\n\n")
+
+scan_fastq_files <- function(sample_info_row) {
+  sample_name <- sample_info_row$sample_name
+  folder      <- sample_info_row$folder
+  sample_dir  <- file.path(SAFE_FASTQ_DIR, folder)
+  if (!dir.exists(sample_dir)) { warning(sprintf("Not found: %s", sample_dir)); return(NULL) }
+  all_files <- list.files(sample_dir, full.names = TRUE, recursive = TRUE)
+  r1 <- all_files[grepl(paste0(sample_name, ".*R1.*\\.fastq\\.gz$"), basename(all_files), ignore.case = TRUE)]
+  r2 <- all_files[grepl(paste0(sample_name, ".*R2.*\\.fastq\\.gz$"), basename(all_files), ignore.case = TRUE)]
+  r1 <- r1[!grepl("\\.md5$", r1)]; r2 <- r2[!grepl("\\.md5$", r2)]
+  md5 <- all_files[grepl(paste0(sample_name, ".*\\.fastq\\.gz\\.md5$"), basename(all_files), ignore.case = TRUE)]
+  list(sample_name = sample_name, group = sample_info_row$group,
+       R1 = sort(r1), R2 = sort(r2), md5 = sort(md5))
+}
+
+fastq_inventory <- lapply(seq_len(nrow(SAMPLE_INFO)), function(i) scan_fastq_files(SAMPLE_INFO[i, ]))
+names(fastq_inventory) <- SAMPLE_INFO$sample_name
+
+cat(sprintf("   %-15s %-8s %-6s %-6s %-6s\n", "Sample", "Group", "R1", "R2", "MD5"))
+cat("   ", paste(rep("-", 55), collapse = ""), "\n")
+for (fi in fastq_inventory)
+  if (!is.null(fi))
+    cat(sprintf("   %-15s %-8s %-6d %-6d %-6d\n", fi$sample_name, fi$group,
+                length(fi$R1), length(fi$R2), length(fi$md5)))
+
+cat("\n   Validating MD5 checksums...\n")
+validate_md5 <- function(fi) {
+  if (length(fi$md5) == 0) { cat(sprintf("   [SKIP] %s\n", fi$sample_name)); return(TRUE) }
+  all_pass <- TRUE
+  for (md5_file in fi$md5) {
+    for (line in readLines(md5_file, warn = FALSE)) {
+      parts <- strsplit(trimws(line), "\\s+")[[1]]
+      if (length(parts) >= 2) {
+        target_file <- file.path(dirname(md5_file), gsub("^\\*", "", parts[2]))
+        if (file.exists(target_file)) {
+          actual <- tools::md5sum(target_file)
+          if (tolower(actual) == tolower(parts[1])) cat(sprintf("   [PASS] %s: %s\n", fi$sample_name, basename(target_file)))
+          else { cat(sprintf("   [FAIL] %s: %s\n", fi$sample_name, basename(target_file))); all_pass <- FALSE }
+        }
+      }
+    }
+  }
+  all_pass
+}
+md5_results <- sapply(fastq_inventory, function(fi) if (!is.null(fi)) validate_md5(fi) else NA)
+cat(sprintf("   MD5: %d/%d passed\n\n", sum(md5_results, na.rm = TRUE), sum(!is.na(md5_results))))
+
+
+# ============================================================
+# 3. BUILD GENOME INDEX
+# ============================================================
+
+cat(">> Step 3: Building genome index...\n")
+SYMLINK_EXT <- create_safe_symlink()
+index_files <- list.files(INDEX_DIR, pattern = "^GRCh38\\.", full.names = FALSE)
+if (length(index_files) <= 3) {
+  if (!file.exists(GENOME_FASTA)) {
+    cat("   [ACTION REQUIRED] Download GRCh38 to external drive.\n")
+    stop("Reference genome not found.")
+  }
+  old <- list.files(INDEX_DIR, pattern = "^GRCh38\\.", full.names = TRUE)
+  if (length(old) > 0) file.remove(old)
+  buildindex(basename = SAFE_INDEX_PREFIX, reference = SAFE_GENOME_FASTA,
+             gappedIndex = TRUE, indexSplit = TRUE, memory = 4000)
+  cat("   [DONE]\n\n")
+} else {
+  cat("   Index exists. Skipping.\n\n")
+}
+
+
+# ============================================================
+# 4. ALIGNMENT
+# ============================================================
+
+cat(">> Step 4: Aligning reads...\n\n")
+SYMLINK_EXT <- create_safe_symlink()
+bam_files <- c(); bam_files_real <- c()
+
+for (fi in fastq_inventory) {
+  if (is.null(fi) || length(fi$R1) == 0 || length(fi$R2) == 0) next
+  safe_bam <- file.path(SAFE_ALIGN_DIR, paste0(fi$sample_name, ".bam"))
+  real_bam <- file.path(ALIGN_DIR, paste0(fi$sample_name, ".bam"))
+  bam_files <- c(bam_files, safe_bam); bam_files_real <- c(bam_files_real, real_bam)
+  names(bam_files)[length(bam_files)] <- fi$sample_name
+  names(bam_files_real)[length(bam_files_real)] <- fi$sample_name
+  if (file.exists(real_bam)) { cat(sprintf("   [SKIP] %s\n", fi$sample_name)); next }
+  cat(sprintf("   Aligning %s...\n", fi$sample_name))
+  tryCatch({
+    align(index = SAFE_INDEX_PREFIX, readfile1 = fi$R1, readfile2 = fi$R2,
+          output_file = safe_bam, type = "rna", input_format = "gzFASTQ",
+          nthreads = N_THREADS, unique = TRUE, nBestLocations = 1)
+    sp <- file.path(ALIGN_DIR, paste0(fi$sample_name, ".sorted"))
+    sb <- paste0(sp, ".bam"); sortBam(real_bam, sp); indexBam(sb)
+    file.remove(real_bam); file.rename(sb, real_bam)
+    if (file.exists(paste0(sb, ".bai"))) file.rename(paste0(sb, ".bai"), paste0(real_bam, ".bai"))
+    cat(sprintf("   [DONE] %s\n", fi$sample_name))
+  }, error = function(e) cat(sprintf("   [ERROR] %s: %s\n", fi$sample_name, e$message)))
+}
+
+
+# ============================================================
+# 5. FEATURE COUNTING
+# ============================================================
+
+cat("\n>> Step 5: featureCounts...\n")
+count_file <- file.path(COUNTS_DIR, "raw_counts.csv")
+if (file.exists(count_file)) {
+  count_matrix <- as.matrix(read.csv(count_file, row.names = 1, check.names = FALSE))
+  cat(sprintf("   Loaded: %d x %d\n\n", nrow(count_matrix), ncol(count_matrix)))
+} else {
+  SYMLINK_EXT <- create_safe_symlink()
+  SAFE_ALIGN_DIR <- file.path(SYMLINK_EXT, "processing", "01_alignment")
+  SAFE_GTF_FILE  <- file.path(SYMLINK_EXT, "reference", "gencode.v44.primary_assembly.annotation.gtf")
+  rb <- list.files(ALIGN_DIR, "\\.bam$", full.names = TRUE)
+  rb <- rb[!grepl("\\.bai$", rb)]
+  if (length(rb) == 0) stop("No BAM files found.")
+  sb <- file.path(SAFE_ALIGN_DIR, basename(rb))
+  for (k in seq_along(sb)) if (!file.exists(sb[k])) stop(paste0("Symlink broken: ", sb[k]))
+  fc <- featureCounts(files = sb, annot.ext = SAFE_GTF_FILE, isGTFAnnotationFile = TRUE,
+    GTF.featureType = "exon", GTF.attrType = "gene_name", isPairedEnd = TRUE,
+    countMultiMappingReads = FALSE, nthreads = N_THREADS)
+  count_matrix <- fc$counts
+  colnames(count_matrix) <- gsub("\\.bam$", "", basename(rb))
+  write.csv(count_matrix, count_file)
+  write.csv(fc$stat, file.path(QC_DIR, "featureCounts_stats.csv"), row.names = FALSE)
+  cat(sprintf("   Saved: %d x %d\n\n", nrow(count_matrix), ncol(count_matrix)))
+}
+
+expected_samples <- SAMPLE_INFO$sample_name
+if (!all(expected_samples %in% colnames(count_matrix))) {
+  cleaned <- gsub("\\.sorted$|\\.bam$", "", colnames(count_matrix))
+  if (all(expected_samples %in% cleaned)) colnames(count_matrix) <- cleaned
+}
+
+
+# ============================================================
+# 6. DESeq2
+# ============================================================
+
+cat(">> Step 6: DESeq2...\n\n")
+
+coldata <- data.frame(sample = colnames(count_matrix), stringsAsFactors = FALSE)
+coldata$group <- SAMPLE_INFO$group[match(coldata$sample, SAMPLE_INFO$sample_name)]
+coldata$group <- factor(coldata$group, levels = c("SC","sgT","sgM","sgT-sgM"))
+rownames(coldata) <- coldata$sample
+
+dds <- DESeqDataSetFromMatrix(count_matrix, coldata, ~ group)
+keep <- rowSums(counts(dds) >= 10) >= 3; dds <- dds[keep, ]; dds <- DESeq(dds)
+
+norm_counts <- counts(dds, normalized = TRUE)
+write.csv(norm_counts, file.path(COUNTS_DIR, "normalized_counts.csv"))
+vsd <- vst(dds, blind = FALSE)
+
+pca_data <- plotPCA(vsd, intgroup = "group", returnData = TRUE)
+pct_var  <- round(100 * attr(pca_data, "percentVar"))
+pca_plot <- ggplot(pca_data, aes(PC1, PC2, color = group, label = name)) +
+  geom_point(size = 4) + geom_text_repel(size = 3) +
+  xlab(paste0("PC1: ", pct_var[1], "%")) + ylab(paste0("PC2: ", pct_var[2], "%")) +
+  ggtitle("PCA") + scale_color_brewer(palette = "Set1") + theme_bw(base_size = 14)
+ggsave(file.path(QC_DIR, "PCA_plot.pdf"), pca_plot, width = 10, height = 8)
+
+cor_matrix <- cor(assay(vsd), method = "pearson")
+pdf(file.path(QC_DIR, "Sample_correlation_heatmap.pdf"), width = 10, height = 8)
+pheatmap(cor_matrix,
+  annotation_col = data.frame(Group = coldata$group, row.names = coldata$sample),
+  annotation_colors = list(Group = c("SC"="#E41A1C","sgT"="#377EB8","sgM"="#4DAF4A","sgT-sgM"="#984EA3")),
+  main = "Correlation (Pearson, VST)", color = colorRampPalette(brewer.pal(9, "Blues"))(100))
+dev.off()
+
+contrasts_list <- list(
+  "sgT_vs_SC"     = c("group","sgT","SC"),     "sgM_vs_SC"     = c("group","sgM","SC"),
+  "sgTsgM_vs_SC"  = c("group","sgT-sgM","SC"), "sgTsgM_vs_sgT" = c("group","sgT-sgM","sgT"),
+  "sgTsgM_vs_sgM" = c("group","sgT-sgM","sgM"), "sgT_vs_sgM"   = c("group","sgT","sgM"))
+
+de_results <- list()
+for (cn in names(contrasts_list)) {
+  cat(sprintf("   Contrast: %s\n", cn))
+  res <- results(dds, contrast = contrasts_list[[cn]], alpha = PADJ_CUTOFF)
+  de_results[[cn]] <- res[order(res$padj), ]
+  rd <- as.data.frame(de_results[[cn]]); rd$gene <- rownames(rd)
+  write.csv(rd, file.path(DE_DIR, paste0("DEG_", cn, ".csv")), row.names = FALSE)
+
+  rd$significance <- "NS"
+  rd$significance[rd$padj < PADJ_CUTOFF & rd$log2FoldChange > LFC_CUTOFF] <- "Up"
+  rd$significance[rd$padj < PADJ_CUTOFF & rd$log2FoldChange < -LFC_CUTOFF] <- "Down"
+  top_genes <- head(rd$gene[rd$significance != "NS"], 20)
+  rd$label <- ifelse(rd$gene %in% top_genes, rd$gene, "")
+  v <- ggplot(rd, aes(log2FoldChange, -log10(padj), color = significance)) +
+    geom_point(alpha = 0.5, size = 1) +
+    geom_text_repel(aes(label = label), size = 2.5, max.overlaps = 20, color = "black") +
+    scale_color_manual(values = c("Down"="blue","NS"="grey70","Up"="red")) +
+    geom_hline(yintercept = -log10(PADJ_CUTOFF), linetype = "dashed") +
+    ggtitle(paste0("Volcano: ", cn)) + theme_bw(base_size = 12)
+  ggsave(file.path(DE_DIR, paste0("Volcano_", cn, ".pdf")), v, width = 8, height = 6)
+}
+cat("   DE complete.\n\n")
+
+
+# ============================================================
+# 7. CellChat DATABASE
+# ============================================================
+
+cat(">> Step 7: CellChat receptors...\n\n")
+
+CellChatDB <- CellChatDB.human; interaction_db <- CellChatDB$interaction; complex_db <- CellChatDB$complex
+
+tnfsf12_interactions <- interaction_db[
+  grepl("TNFSF12|TWEAK|TNFRSF12", interaction_db$interaction_name, ignore.case = TRUE) |
+    grepl("TNFSF12", interaction_db$ligand, ignore.case = TRUE), ]
+mdk_interactions <- interaction_db[
+  grepl("MDK", interaction_db$interaction_name, ignore.case = TRUE) |
+    grepl("MDK", interaction_db$ligand, ignore.case = TRUE), ]
+
+extract_receptor_genes <- function(df) {
+  receptors <- unique(unlist(strsplit(as.character(df$receptor), "[_+, ]+")))
+  receptors <- receptors[receptors != "" & !is.na(receptors)]
+  expanded <- c()
+  for (r in receptors) {
+    if (r %in% rownames(complex_db)) {
+      cc <- unlist(complex_db[r, ]); expanded <- c(expanded, cc[cc != "" & !is.na(cc)])
+    } else expanded <- c(expanded, r)
+  }
+  unique(expanded)
+}
+
+tnfsf12_receptors <- extract_receptor_genes(tnfsf12_interactions)
+mdk_receptors <- extract_receptor_genes(mdk_interactions)
+all_receptor_genes <- unique(c(tnfsf12_receptors, mdk_receptors))
+
+cellchat_summary <- rbind(
+  data.frame(Ligand = "TNFSF12", Receptor_Gene = tnfsf12_receptors, stringsAsFactors = FALSE),
+  data.frame(Ligand = "MDK", Receptor_Gene = mdk_receptors, stringsAsFactors = FALSE))
+write.csv(cellchat_summary, file.path(CELLCHAT_DIR, "CellChatDB_receptor_genes.csv"), row.names = FALSE)
+write.csv(tnfsf12_interactions, file.path(CELLCHAT_DIR, "CellChatDB_TNFSF12_interactions.csv"), row.names = FALSE)
+write.csv(mdk_interactions, file.path(CELLCHAT_DIR, "CellChatDB_MDK_interactions.csv"), row.names = FALSE)
+
+
+# ============================================================
+# 8. RECEPTOR EXPRESSION
+# ============================================================
+
+cat(">> Step 8: Receptor expression...\n\n")
+
+available_receptors <- all_receptor_genes[all_receptor_genes %in% rownames(norm_counts)]
+ligand_genes <- c("TNFSF12","MDK")
+genes_to_plot <- unique(c(ligand_genes, available_receptors))
+genes_to_plot <- genes_to_plot[genes_to_plot %in% rownames(norm_counts)]
+
+receptor_expr <- norm_counts[genes_to_plot, , drop = FALSE]
+ha_col <- data.frame(Group = coldata$group, row.names = coldata$sample)
+ann_colors <- list(Group = c("SC"="#E41A1C","sgT"="#377EB8","sgM"="#4DAF4A","sgT-sgM"="#984EA3"))
+
+gene_annotation <- data.frame(row.names = genes_to_plot,
+  Type = ifelse(genes_to_plot %in% ligand_genes, "Ligand",
+    ifelse(genes_to_plot %in% tnfsf12_receptors & genes_to_plot %in% mdk_receptors, "Shared",
+      ifelse(genes_to_plot %in% tnfsf12_receptors, "TNFSF12_R", "MDK_R"))))
+
+pdf(file.path(CELLCHAT_DIR, "Receptor_expression_heatmap.pdf"), width = 12, height = 8)
+pheatmap(log2(receptor_expr + 1), annotation_col = ha_col, annotation_row = gene_annotation,
+  annotation_colors = ann_colors, scale = "row", main = "Receptor Expression",
+  color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100))
+dev.off()
+
+receptor_long <- as.data.frame(t(receptor_expr)) %>%
+  mutate(sample = rownames(.), group = coldata[rownames(.), "group"]) %>%
+  pivot_longer(-c(sample, group), names_to = "gene", values_to = "expression")
+
+bp <- ggplot(receptor_long, aes(group, log2(expression + 1), fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + geom_jitter(width = 0.2, size = 2) +
+  facet_wrap(~gene, scales = "free_y", ncol = 4) + scale_fill_brewer(palette = "Set1") +
+  labs(title = "Receptor Expression", x = "Group", y = "Log2(Expr+1)") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(CELLCHAT_DIR, "Receptor_expression_boxplot.pdf"), bp, width = 16, height = 12)
+
+receptor_stats <- data.frame()
+for (gene in genes_to_plot) {
+  ebg <- split(norm_counts[gene, ], coldata$group)
+  aov_res <- tryCatch(summary(aov(expr ~ group, data.frame(expr = as.numeric(norm_counts[gene,]), group = coldata$group))), error = function(e) NULL)
+  anova_p <- ifelse(!is.null(aov_res), aov_res[[1]]$`Pr(>F)`[1], NA)
+  for (grp in c("sgT","sgM","sgT-sgM")) {
+    tt <- tryCatch(t.test(as.numeric(ebg[["SC"]]), as.numeric(ebg[[grp]])), error = function(e) list(p.value = NA))
+    msc <- mean(as.numeric(ebg[["SC"]])); mt <- mean(as.numeric(ebg[[grp]]))
+    fc <- mt / max(msc, 0.01)
+    receptor_stats <- rbind(receptor_stats, data.frame(
+      Gene = gene, Comparison = paste0(grp, "_vs_SC"), Mean_SC = round(msc, 2),
+      Mean_Treatment = round(mt, 2), FoldChange = round(fc, 3), Log2FC = round(log2(fc + 0.001), 3),
+      P_value = signif(tt$p.value, 4), ANOVA_P = signif(anova_p, 4),
+      Ligand_Source = ifelse(gene %in% ligand_genes, "Ligand",
+        ifelse(gene %in% tnfsf12_receptors & gene %in% mdk_receptors, "Both",
+          ifelse(gene %in% tnfsf12_receptors, "TNFSF12", "MDK"))),
+      stringsAsFactors = FALSE))
+  }
+}
+write.csv(receptor_stats, file.path(CELLCHAT_DIR, "Receptor_expression_statistics.csv"), row.names = FALSE)
+cat("   Receptor analysis complete.\n\n")
+
+
+# ============================================================
+# 9. GSEA: FULL MSigDB + CUSTOM SIGNATURES
+# ============================================================
+
+cat(">> Step 9: GSEA (MSigDB + Custom)...\n\n")
+
+# --- 9a. Ensure all required objects exist (safe for fresh-session re-runs) ---
+if (!exists("MSIGDB_USE_C2")) MSIGDB_USE_C2 <- TRUE
+if (!exists("MSIGDB_USE_C5")) MSIGDB_USE_C5 <- TRUE
+if (!exists("MSIGDB_USE_C6")) MSIGDB_USE_C6 <- TRUE
+if (!exists("MSIGDB_USE_C7")) MSIGDB_USE_C7 <- FALSE
+
+# Define the dedup helper HERE so it is always available even if only
+# Step 9 is re-sourced in a fresh R session.
+make_unique_display_names <- function(x) {
+  dupes <- duplicated(x) | duplicated(x, fromLast = TRUE)
+  if (any(dupes)) {
+    dupe_vals <- unique(x[dupes])
+    for (dv in dupe_vals) {
+      idx <- which(x == dv)
+      x[idx] <- paste0(x[idx], " (", seq_along(idx), ")")
+    }
+  }
+  return(x)
+}
+
+cat(sprintf("   MSigDB flags: C2=%s C5=%s C6=%s C7=%s\n\n",
+            MSIGDB_USE_C2, MSIGDB_USE_C5, MSIGDB_USE_C6, MSIGDB_USE_C7))
+
+# --- 9b. Load MSigDB collections ---
+cat("   9b. Loading MSigDB collections...\n")
+
+load_msigdb_collection <- function(category, subcategory = NULL, label = NULL) {
+  tag <- ifelse(!is.null(subcategory), paste0(category, ":", subcategory), category)
+  dl <- ifelse(is.null(label), tag, label)
+  tryCatch({
+    gs <- if (!is.null(subcategory)) msigdbr(species = "Homo sapiens", category = category, subcategory = subcategory)
+          else msigdbr(species = "Homo sapiens", category = category)
+    result <- split(gs$gene_symbol, gs$gs_name)
+    cat(sprintf("     [%s] %s: %d sets\n", tag, dl, length(result)))
+    result
+  }, error = function(e) { cat(sprintf("     [%s] %s: FAILED (%s)\n", tag, dl, e$message)); list() })
+}
+
+discover_subcategories <- function(category) {
+  gs_all <- tryCatch(msigdbr(species = "Homo sapiens", category = category), error = function(e) NULL)
+  if (is.null(gs_all) || nrow(gs_all) == 0) return(character(0))
+  subcats <- unique(gs_all$gs_subcat)
+  subcats <- subcats[subcats != "" & !is.na(subcats)]
+  cat(sprintf("   Available %s subcategories: %s\n", category, paste(subcats, collapse = ", ")))
+  subcats
+}
+
+load_by_pattern <- function(category, desired_list) {
+  subcats <- discover_subcategories(category)
+  result <- list()
+  for (d in desired_list) {
+    matched <- subcats[grepl(d$pattern, subcats, ignore.case = TRUE)]
+    if (length(matched) > 0) {
+      sub_list <- load_msigdb_collection(category, matched[1], label = d$label)
+      result <- c(result, sub_list)
+    } else {
+      cat(sprintf("     [%s:%s] not found, skipping\n", category, d$pattern))
+    }
+  }
+  if (length(result) == 0) {
+    cat(sprintf("   No %s subcategories matched. Loading entire %s...\n", category, category))
+    result <- load_msigdb_collection(category, label = paste0(category, " (all)"))
+  }
+  result
+}
+
+hallmark_list <- load_msigdb_collection("H", label = "Hallmark")
+
+c2_cp_list <- list()
+if (MSIGDB_USE_C2)
+  c2_cp_list <- load_by_pattern("C2", list(
+    list(pattern = "KEGG", label = "KEGG"), list(pattern = "REACTOME", label = "Reactome"),
+    list(pattern = "WIKIPATHWAYS", label = "WikiPathways"),
+    list(pattern = "PID", label = "PID"), list(pattern = "BIOCARTA", label = "BioCarta")))
+
+c5_go_list <- list()
+if (MSIGDB_USE_C5)
+  c5_go_list <- load_by_pattern("C5", list(
+    list(pattern = "GO:BP", label = "GO BP"), list(pattern = "GO:MF", label = "GO MF"),
+    list(pattern = "GO:CC", label = "GO CC")))
+
+c6_onc_list <- list()
+if (MSIGDB_USE_C6) c6_onc_list <- load_msigdb_collection("C6", label = "Oncogenic")
+c7_imm_list <- list()
+if (MSIGDB_USE_C7) c7_imm_list <- load_msigdb_collection("C7", label = "Immunologic")
+
+# --- 9c. Custom gene signatures ---
+cat("\n   9c. Custom gene signatures...\n")
+
+ASPC_SIGNATURE <- c("LAMA2","THBS3","FGF2","POSTN","THBS2","VCAN","LAMB1","COL4A1","GAS6","BMPER",
+  "COL5A1","COL6A5","COL5A3","ENTPD2","ALDH1A1","MFAP2","COL5A2","LOXL2","FBLN7","BDH2",
+  "COL3A1","GPC6","LGI2","AK1","SRPX2","LOXL3","NOTCH3","CLU","CTHRC1","FGFR1","C3",
+  "DPEP1","SSC5D","NAALAD2","ITGBL1","FOXS1","COL11A1","NNMT","HEYL","TFCP2L1","PRG4",
+  "ZFHX4","BNC2","ADAMTS2","NFASC","CHRD","PDGFRL","C1QTNF2","ANO1","HOXB7","ADAMTS15",
+  "ADAMTS12","IGSF10","DNM1","CHL1","HAS2","CYGB","NR2F1","ZFPM2","ADAMTS5","CP","SULF1",
+  "C2","PCSK5","PTPRD","FAP","TNFAIP6","S100A16","HSD11B1","TIMP1","BMP1","CACNA2D1","TBX2",
+  "RBP1","NFATC4","GPRC5B","MMP11","DPYSL3","ADAMTSL1","KRT7","FST","ID4","SERPINH1","MDK",
+  "HOXC8","PDGFRA","ANGPT4","HIGD1B","MMP3","GPR153","MEG3","ISL1","TSPAN11","HOXC9","GJC1",
+  "SMIM22","ABCC9","ILDR2","HP","LHFP","NTRK2","FEZ1","FMO2","FZD2","TMEM45A","MMP15",
+  "CRLF1","TENM3","ARHGEF25","FOXC2","PIEZO2","S1PR3","CADM3","DCLK1","LRRN2","LBP","KCNE4",
+  "PLS3","PKDCC","NUMBL","STOX2","PLCE1","STEAP3","PDE1A","CCDC102B","PRKG1","ARHGAP42",
+  "S100A14","ELF3","SPHK1","NAV3","FXYD1","SULT1E1","GABRA3","MEDAG","GPR39","PALM2-AKAP2",
+  "CASP12","SNTG1","CERCAM","FKBP9","CDR2L","PTK7","KIF21A","NSG1","ROBO1","CCDC74A")
+
+NEPC_BELTRAN_UP <- c("ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1",
+  "C7orf76","GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1","RGS7","SCG3",
+  "SEC11C","SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2","MYCN")
+NEPC_BELTRAN_DOWN <- c("AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT","FOXP1",
+  "HERPUD1","MMP2","MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2","MAPKAPK3","SPDEF",
+  "ARHGAP8","CATSPERB","EFNA4","EPN3","EVPL","HOXB13","KLK3","KLK4","LMAN1L","NKX3-1",
+  "OPHN1","PIEZO1","PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2","SLC25A37","SLC44A4",
+  "TC2N","UPK2","RB1")
+
+TNFSF12_SIGNATURE <- c("TNFSF12","TNFRSF12A")
+MDK_SIGNATURE <- c("MDK","ALK","ITGA4","ITGA6","ITGB1","LRP1","NCL","PTPRZ1","SDC1","SDC2","SDC4")
+
+HALLMARK_ADIPOGENESIS_CUSTOM <- c("ABCA1","ABCB8","ACAA2","ACADL","ACADM","ACADS","ACLY","ACO2",
+  "ACOX1","ADCY6","ADIG","ADIPOQ","ADIPOR2","AGPAT3","AIFM1","AK2","ALDH2","ALDOA","ANGPT1",
+  "ANGPTL4","APLP2","APOE","ARAF","ARL4A","ATL2","ATP1B3","ATP5PO","BAZ2A","BCKDHA","BCL2L13",
+  "BCL6","C3","CAT","CAVIN1","CAVIN2","CCNG2","CD151","CD302","CD36","CDKN2C","CHCHD10","CHUK",
+  "CIDEA","CMBL","CMPK1","COL15A1","COL4A1","COQ3","COQ5","COQ9","COX6A1","COX7B","COX8A",
+  "CPT2","CRAT","CS","CYC1","CYP4B1","DBT","DDT","DECR1","DGAT1","DHCR7","DHRS7","DHRS7B",
+  "DLAT","DLD","DNAJB9","DNAJC15","DRAM2","ECH1","ECHS1","ELMOD3","ELOVL6","ENPP2","EPHX2",
+  "ESRRA","ESYT1","ETFB","FABP4","FAH","FZD4","G3BP2","GADD45A","GBE1","GHITM","GPAM","GPAT4",
+  "GPD2","GPHN","GPX3","GPX4","GRPEL1","HADH","HIBCH","HSPB8","IDH1","IDH3A","IDH3G","IFNGR1",
+  "IMMT","ITGA7","ITIH5","ITSN1","JAGN1","LAMA4","LEP","LIFR","LIPE","LPCAT3","LPL","LTC4S",
+  "MAP4K3","MCCC1","MDH2","ME1","MGLL","MGST3","MIGA2","MRAP","MRPL15","MTARC2","MTCH2","MYLK",
+  "NABP1","NDUFA5","NDUFAB1","NDUFB7","NDUFS3","NKIRAS1","NMT1","OMD","ORM1","PDCD4","PEMT",
+  "PEX14","PFKFB3","PFKL","PGM1","PHLDB1","PHYH","PIM3","PLIN2","POR","PPARG","PPM1B",
+  "PPP1R15B","PRDX3","PREB","PTCD3","PTGER3","QDPR","RAB34","REEP5","REEP6","RETN","RETSAT",
+  "RIOK3","RMDN3","RNF11","RREB1","RTN3","SAMM50","SCARB1","SCP2","SDHB","SDHC","SLC19A1",
+  "SLC1A5","SLC25A1","SLC25A10","SLC27A1","SLC5A6","SLC66A3","SNCG","SOD1","SORBS1","SOWAHC",
+  "SPARCL1","SQOR","SSPN","STAT5A","STOM","SUCLG1","SULT1A1","TALDO1","TANK","TKT","TOB1",
+  "TST","UBC","UBQLN1","UCK1","UCP2","UQCR10","UQCR11","UQCRC1","UQCRQ","VEGFB","YWHAG")
+
+HALLMARK_AR_SIGNATURE <- c("ABCC4","ABHD2","ACSL3","ACTN1","ADAMTS1","ADRM1","AKAP12","AKT1",
+  "ALDH1A3","ANKH","APPBP2","ARID5B","AZGP1","B2M","B4GALT1","BMPR1B","CAMKK2","CCND1",
+  "CCND3","CDC14B","CDK6","CENPN","DBI","DHCR24","DNAJB9","ELK4","ELL2","ELOVL5","FADS1",
+  "FKBP5","GNAI3","GPD1L","GSR","GUCY1A1","H1-0","HERC3","HMGCR","HMGCS1","HOMER2","HPGD",
+  "HSD17B14","IDI1","INPP4B","INSIG1","IQGAP2","ITGAV","KLK2","KLK3","KRT19","KRT8","LIFR",
+  "LMAN1","MAF","MAK","MAP7","MERTK","MYL12A","NCOA4","NDRG1","NGLY1","NKX3-1","PA2G4",
+  "PDLIM5","PGM3","PIAS1","PLPP1","PMEPA1","PTK2B","PTPN21","RAB4A","RPS6KA3","RRP12","SAT1",
+  "SCD","SEC24D","SELENOP","SGK1","SLC26A2","SLC38A2","SMS","SORD","SPCS3","SPDEF","SRF",
+  "SRP19","STEAP4","STK39","TARP","TMEM50A","TMPRSS2","TNFAIP8","TPD52","TSC22D1","UAP1",
+  "UBE2I","UBE2J1","VAPA","XRCC5","XRCC6","ZBTB10","ZMIZ1")
+
+custom_gene_sets <- list(
+  "CUSTOM_ASPC_SIGNATURE"             = ASPC_SIGNATURE,
+  "CUSTOM_NEPC_BELTRAN_UP"            = NEPC_BELTRAN_UP,
+  "CUSTOM_NEPC_BELTRAN_DOWN"          = NEPC_BELTRAN_DOWN,
+  "CUSTOM_TNFSF12_SIGNATURE"          = TNFSF12_SIGNATURE,
+  "CUSTOM_MDK_SIGNATURE"              = MDK_SIGNATURE,
+  "CUSTOM_HALLMARK_ADIPOGENESIS"      = HALLMARK_ADIPOGENESIS_CUSTOM,
+  "CUSTOM_HALLMARK_ANDROGEN_RESPONSE" = HALLMARK_AR_SIGNATURE)
+
+cat(sprintf("   Custom: %d sets\n", length(custom_gene_sets)))
+
+# --- 9d. Assemble collections ---
+cat("\n   9d. Assembling collections...\n")
+
+gsea_collections <- list("Hallmark" = hallmark_list, "Custom" = custom_gene_sets)
+if (MSIGDB_USE_C2 && length(c2_cp_list) > 0) gsea_collections[["C2_Curated"]] <- c2_cp_list
+if (MSIGDB_USE_C5 && length(c5_go_list) > 0) gsea_collections[["C5_GO"]] <- c5_go_list
+if (MSIGDB_USE_C6 && length(c6_onc_list) > 0) gsea_collections[["C6_Oncogenic"]] <- c6_onc_list
+if (MSIGDB_USE_C7 && length(c7_imm_list) > 0) gsea_collections[["C7_Immunologic"]] <- c7_imm_list
+
+all_gene_sets <- do.call(c, gsea_collections)
+all_gene_sets <- all_gene_sets[!duplicated(names(all_gene_sets))]
+
+cat("\n   === GSEA COLLECTIONS ===\n")
+for (cn in names(gsea_collections)) cat(sprintf("     %-20s: %5d\n", cn, length(gsea_collections[[cn]])))
+cat(sprintf("     %-20s: %5d (deduped)\n\n", "TOTAL", length(all_gene_sets)))
+
+for (cn in names(gsea_collections))
+  dir.create(file.path(GSEA_DIR, cn), recursive = TRUE, showWarnings = FALSE)
+
+# --- 9e. Run GSEA per collection, per contrast ---
+cat("   9e. Running GSEA...\n\n")
+
+gsea_results_all     <- list()
+gsea_results_by_coll <- list()
+
+for (contrast_name in names(de_results)) {
+  cat(sprintf("   === Contrast: %s ===\n", contrast_name))
+
+  res <- de_results[[contrast_name]]
+  res_df <- as.data.frame(res)
+  res_df <- res_df[!is.na(res_df$log2FoldChange) & !is.na(res_df$pvalue), ]
+  gene_list <- if ("stat" %in% colnames(res_df)) res_df$stat else res_df$log2FoldChange
+  names(gene_list) <- rownames(res_df)
+  gene_list <- sort(gene_list, decreasing = TRUE)
+
+  gsea_results_by_coll[[contrast_name]] <- list()
+
+  for (coll_name in names(gsea_collections)) {
+    coll_sets <- gsea_collections[[coll_name]]
+    cat(sprintf("     Running %s (%d sets)...", coll_name, length(coll_sets)))
+
+    fgsea_res <- fgsea(pathways = coll_sets, stats = gene_list,
+                       minSize = 2, maxSize = 500, nPermSimple = 10000)
+    fgsea_res <- fgsea_res[order(fgsea_res$padj), ]
+    gsea_results_by_coll[[contrast_name]][[coll_name]] <- fgsea_res
+
+    n_sig <- sum(fgsea_res$padj < 0.25, na.rm = TRUE)
+    cat(sprintf(" %d sig\n", n_sig))
+
+    fgsea_out <- as.data.frame(fgsea_res)
+    fgsea_out$leadingEdge <- sapply(fgsea_out$leadingEdge, paste, collapse = "; ")
+    write.csv(fgsea_out, file.path(GSEA_DIR, coll_name,
+              paste0("GSEA_", coll_name, "_", contrast_name, ".csv")), row.names = FALSE)
+
+    # --- Barplot (with dedup fix) ---
+    sig_pw <- fgsea_res[fgsea_res$padj < 0.25, ]
+    if (nrow(sig_pw) > 0) {
+      if (nrow(sig_pw) > 40) sig_pw <- head(sig_pw[order(sig_pw$padj), ], 40)
+
+      sig_pw$pathway_short <- sig_pw$pathway
+      sig_pw$pathway_short <- gsub("^HALLMARK_", "", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^CUSTOM_", "* ", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^GOBP_|^GOCC_|^GOMF_", "", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^KEGG_MEDICUS_|^KEGG_LEGACY_|^KEGG_", "KEGG:", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^REACTOME_", "R:", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^WP_", "WP:", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^PID_", "PID:", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("^BIOCARTA_", "BC:", sig_pw$pathway_short)
+      sig_pw$pathway_short <- gsub("_", " ", sig_pw$pathway_short)
+      sig_pw$pathway_short <- ifelse(nchar(sig_pw$pathway_short) > 65,
+                                      paste0(substr(sig_pw$pathway_short, 1, 62), "..."),
+                                      sig_pw$pathway_short)
+
+      # Deduplicate THEN factor
+      sig_pw <- sig_pw[order(sig_pw$NES), ]
+      sig_pw$pathway_short <- make_unique_display_names(sig_pw$pathway_short)
+      sig_pw$pathway_short <- factor(sig_pw$pathway_short, levels = sig_pw$pathway_short)
+
+      gsea_bar <- ggplot(sig_pw, aes(x = NES, y = pathway_short, fill = padj)) +
+        geom_col() + scale_fill_gradient(low = "red", high = "blue", name = "padj") +
+        labs(title = paste0("GSEA [", coll_name, "]: ", contrast_name), x = "NES", y = NULL) +
+        theme_bw(base_size = 11) + theme(axis.text.y = element_text(size = 7))
+      ggsave(file.path(GSEA_DIR, coll_name,
+                        paste0("GSEA_barplot_", coll_name, "_", contrast_name, ".pdf")),
+             gsea_bar, width = 14, height = max(6, nrow(sig_pw) * 0.3 + 3))
+    }
+
+    # Enrichment plots (top 5)
+    top_pw <- head(fgsea_res$pathway[fgsea_res$padj < 0.1], 5)
+    if (length(top_pw) > 0) {
+      pdf(file.path(GSEA_DIR, coll_name,
+                     paste0("GSEA_enrichment_", coll_name, "_", contrast_name, ".pdf")),
+          width = 10, height = 6)
+      for (pw in top_pw) {
+        p <- plotEnrichment(coll_sets[[pw]], gene_list) +
+          ggtitle(paste0(gsub("^HALLMARK_|^CUSTOM_|^GOBP_|^REACTOME_|^KEGG_", "", pw),
+                         "\n", contrast_name, " [", coll_name, "]")) + theme_bw(base_size = 12)
+        print(p)
+      }
+      dev.off()
+    }
+  }
+
+  # Custom enrichment plots
+  coll_custom <- gsea_results_by_coll[[contrast_name]][["Custom"]]
+  if (!is.null(coll_custom)) {
+    pdf(file.path(GSEA_DIR, "Custom",
+                   paste0("GSEA_custom_enrichment_", contrast_name, ".pdf")), width = 10, height = 6)
+    for (cs_name in names(custom_gene_sets)) {
+      cs_row <- coll_custom[coll_custom$pathway == cs_name, ]
+      if (nrow(cs_row) > 0) {
+        p <- plotEnrichment(custom_gene_sets[[cs_name]], gene_list) +
+          ggtitle(paste0(gsub("^CUSTOM_", "", cs_name), "\n", contrast_name,
+                         sprintf("  |  NES=%.2f  padj=%.3g", cs_row$NES, cs_row$padj))) +
+          theme_bw(base_size = 12)
+        print(p)
+      }
+    }
+    dev.off()
+  }
+
+  # Master combined
+  cat(sprintf("     Running MASTER (%d sets)...", length(all_gene_sets)))
+  fgsea_master <- fgsea(pathways = all_gene_sets, stats = gene_list,
+                        minSize = 2, maxSize = 500, nPermSimple = 10000)
+  fgsea_master <- fgsea_master[order(fgsea_master$padj), ]
+  gsea_results_all[[contrast_name]] <- fgsea_master
+  cat(sprintf(" %d sig\n", sum(fgsea_master$padj < 0.25, na.rm = TRUE)))
+
+  fgsea_mo <- as.data.frame(fgsea_master)
+  fgsea_mo$leadingEdge <- sapply(fgsea_mo$leadingEdge, paste, collapse = "; ")
+  write.csv(fgsea_mo, file.path(GSEA_DIR, paste0("GSEA_ALL_combined_", contrast_name, ".csv")),
+            row.names = FALSE)
+
+  # Hallmark + Custom barplot (with dedup fix)
+  hc_res <- fgsea_master[fgsea_master$pathway %in% c(names(hallmark_list), names(custom_gene_sets)), ]
+  sig_hc <- hc_res[hc_res$padj < 0.25, ]
+  if (nrow(sig_hc) > 0) {
+    sig_hc$pathway_short <- gsub("^HALLMARK_", "", sig_hc$pathway)
+    sig_hc$pathway_short <- gsub("^CUSTOM_", "* ", sig_hc$pathway_short)
+    sig_hc$pathway_short <- gsub("_", " ", sig_hc$pathway_short)
+    sig_hc <- sig_hc[order(sig_hc$NES), ]
+    sig_hc$pathway_short <- make_unique_display_names(sig_hc$pathway_short)
+    sig_hc$pathway_short <- factor(sig_hc$pathway_short, levels = sig_hc$pathway_short)
+
+    ghc <- ggplot(sig_hc, aes(x = NES, y = pathway_short, fill = padj)) +
+      geom_col() + scale_fill_gradient(low = "red", high = "blue", name = "padj") +
+      labs(title = paste0("GSEA (Hallmark + Custom): ", contrast_name),
+           subtitle = "Custom prefixed with *", x = "NES", y = NULL) + theme_bw(base_size = 11)
+    ggsave(file.path(GSEA_DIR, paste0("GSEA_barplot_Hallmark_Custom_", contrast_name, ".pdf")),
+           ghc, width = 12, height = max(6, nrow(sig_hc) * 0.3 + 3))
+  }
+  cat("\n")
+}
+
+# --- 9f. Custom summary ---
+cat("   === CUSTOM SIGNATURE SUMMARY ===\n\n")
+custom_summary <- data.frame()
+for (cn in names(gsea_results_all)) {
+  fr <- gsea_results_all[[cn]]
+  for (cs in names(custom_gene_sets)) {
+    cr <- fr[fr$pathway == cs, ]
+    if (nrow(cr) > 0) custom_summary <- rbind(custom_summary, data.frame(
+      Contrast = cn, Signature = gsub("^CUSTOM_", "", cs),
+      NES = round(cr$NES, 3), pval = signif(cr$pval, 4),
+      padj = signif(cr$padj, 4), size = cr$size, stringsAsFactors = FALSE))
+  }
+}
+if (nrow(custom_summary) > 0) {
+  print(custom_summary, row.names = FALSE)
+  write.csv(custom_summary, file.path(GSEA_DIR, "GSEA_custom_signatures_summary.csv"), row.names = FALSE)
+}
+
+# --- 9g. Top pathways per collection ---
+cat("\n   === TOP PATHWAYS BY COLLECTION ===\n\n")
+collection_top_summary <- data.frame()
+for (cn in names(gsea_results_by_coll))
+  for (co in names(gsea_results_by_coll[[cn]])) {
+    cr <- gsea_results_by_coll[[cn]][[co]]
+    cs <- cr[cr$padj < 0.25, ]
+    ct <- head(cs[order(cs$padj), ], 10)
+    if (nrow(ct) > 0) collection_top_summary <- rbind(collection_top_summary, data.frame(
+      Contrast = cn, Collection = co, Pathway = ct$pathway,
+      NES = round(ct$NES, 3), padj = signif(ct$padj, 3), size = ct$size,
+      stringsAsFactors = FALSE))
+  }
+if (nrow(collection_top_summary) > 0)
+  write.csv(collection_top_summary, file.path(GSEA_DIR, "GSEA_top_pathways_by_collection.csv"), row.names = FALSE)
+cat("   GSEA complete.\n\n")
+
+# ============================================================
+# 9h. C6 BARPLOT + 6 ENRICHMENT PLOTS: sgTsgM_vs_SC (Standalone)
+# ============================================================
+# Outputs:
+#   1 barplot PDF showing only the 6 selected signatures
+#   6 individual enrichment PDFs
+#   1 combined enrichment PDF
+#   1 CSV summary
+# ============================================================
+
+cat("   9h. Generating C6 barplot + enrichment plots (sgTsgM_vs_SC)...\n\n")
+
+# --- 9h.0 Load required packages ---
+library(DESeq2)
+library(fgsea)
+library(msigdbr)
+library(ggplot2)
+
+# --- 9h.1 Paths ---
+EXTERNAL_BASE <- "/Volumes/Jingjing Chen/Bulk mRNA seq ADMSC Crispr 22Rv1 tumor"
+COUNTS_DIR    <- file.path(EXTERNAL_BASE, "processing", "02_counts")
+
+OUTPUT_C6_DIR <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Bulk mRNA seq ADMSC Crispr 22Rv1 tumor/05_GSEA_Hallmarks/C6_Oncogenic"
+dir.create(OUTPUT_C6_DIR, recursive = TRUE, showWarnings = FALSE)
+
+cat(sprintf("   Output directory: %s\n\n", OUTPUT_C6_DIR))
+
+# --- 9h.2 Reload count matrix and build coldata ---
+cat("   Loading count matrix...\n")
+count_matrix <- as.matrix(read.csv(file.path(COUNTS_DIR, "raw_counts.csv"),
+                                   row.names = 1, check.names = FALSE))
+
+SAMPLE_INFO <- data.frame(
+  sample_name = c("SC-1","SC-2","SC-3","sgT-1","sgT-2","sgT-3",
+                  "sgM-1","sgM-2","sgM-3","sgT-sgM-1","sgT-sgM-2","sgT-sgM-3"),
+  group = c(rep("SC",3), rep("sgT",3), rep("sgM",3), rep("sgT-sgM",3)),
+  stringsAsFactors = FALSE)
+
+expected_samples <- SAMPLE_INFO$sample_name
+if (!all(expected_samples %in% colnames(count_matrix))) {
+  cleaned <- gsub("\\.sorted$|\\.bam$", "", colnames(count_matrix))
+  if (all(expected_samples %in% cleaned)) colnames(count_matrix) <- cleaned
+}
+
+coldata <- data.frame(sample = colnames(count_matrix), stringsAsFactors = FALSE)
+coldata$group <- SAMPLE_INFO$group[match(coldata$sample, SAMPLE_INFO$sample_name)]
+coldata$group <- factor(coldata$group, levels = c("SC","sgT","sgM","sgT-sgM"))
+rownames(coldata) <- coldata$sample
+
+cat(sprintf("   Count matrix: %d genes x %d samples\n", nrow(count_matrix), ncol(count_matrix)))
+
+# --- 9h.3 DESeq2 for sgTsgM_vs_SC ---
+cat("   Running DESeq2...\n")
+dds <- DESeqDataSetFromMatrix(count_matrix, coldata, ~ group)
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+
+res_dual <- results(dds, contrast = c("group", "sgT-sgM", "SC"), alpha = 0.05)
+res_dual_df <- as.data.frame(res_dual)
+res_dual_df <- res_dual_df[!is.na(res_dual_df$log2FoldChange) & !is.na(res_dual_df$pvalue), ]
+cat(sprintf("   DESeq2 complete: %d testable genes\n", nrow(res_dual_df)))
+
+# --- 9h.4 Build ranked gene list ---
+gene_list_dual <- if ("stat" %in% colnames(res_dual_df)) res_dual_df$stat else res_dual_df$log2FoldChange
+names(gene_list_dual) <- rownames(res_dual_df)
+gene_list_dual <- sort(gene_list_dual, decreasing = TRUE)
+cat(sprintf("   Ranked gene list: %d genes\n", length(gene_list_dual)))
+
+# --- 9h.5 Load C6 oncogenic gene sets ---
+cat("   Loading C6 oncogenic signatures from MSigDB...\n")
+c6_all <- msigdbr(species = "Homo sapiens", category = "C6")
+c6_onc_list <- split(c6_all$gene_symbol, c6_all$gs_name)
+cat(sprintf("   Loaded %d C6 gene sets\n", length(c6_onc_list)))
+
+# --- 9h.6 Run fgsea ---
+cat("   Running fgsea on C6 collection...\n")
+c6_gsea_dual <- fgsea(pathways = c6_onc_list, stats = gene_list_dual,
+                      minSize = 2, maxSize = 500, nPermSimple = 10000)
+c6_gsea_dual <- c6_gsea_dual[order(c6_gsea_dual$padj), ]
+cat(sprintf("   fgsea complete: %d significant (padj < 0.25)\n\n",
+            sum(c6_gsea_dual$padj < 0.25, na.rm = TRUE)))
+
+# --- 9h.7 Define targets ---
+targets <- list(
+  list(search  = "KRAS.KIDNEY_UP.V1_UP",
+       outfile = "GSEA_enrichment_KRAS_KIDNEY_UP_V1_UP_sgTsgM_vs_SC.pdf"),
+  list(search  = "RAF_UP.V1_UP",
+       outfile = "GSEA_enrichment_RAF_UP_V1_UP_sgTsgM_vs_SC.pdf"),
+  list(search  = "PRC2_EED_DN.V1_UP",
+       outfile = "GSEA_enrichment_PRC2_EED_DN_V1_UP_sgTsgM_vs_SC.pdf"),
+  list(search  = "PRC2_EED_DN.V1_DN",
+       outfile = "GSEA_enrichment_PRC2_EED_DN_V1_DN_sgTsgM_vs_SC.pdf"),
+  list(search  = "ESC_V6.5_UP_LATE.V1_UP",
+       outfile = "GSEA_enrichment_ESC_V6_5_UP_LATE_V1_UP_sgTsgM_vs_SC.pdf"),
+  list(search  = "ESC_V6.5_UP_LATE.V1_DN",
+       outfile = "GSEA_enrichment_ESC_V6_5_UP_LATE_V1_DN_sgTsgM_vs_SC.pdf")
+)
+
+# --- 9h.8 Fuzzy-match helper ---
+find_c6_pathway_name <- function(target_name, available_names) {
+  if (target_name %in% available_names) return(target_name)
+  alt <- gsub("\\.", "_", target_name)
+  if (alt %in% available_names) return(alt)
+  idx <- grep(target_name, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx) > 0) return(available_names[idx[1]])
+  idx2 <- grep(alt, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx2) > 0) return(available_names[idx2[1]])
+  core <- gsub("\\.V1_(UP|DN)$", "", target_name)
+  core_alt <- gsub("_V1_(UP|DN)$", "", alt)
+  suffix <- sub(".*V1_", "", target_name)
+  idx3 <- grep(core_alt, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx3) > 0) {
+    exact_match <- idx3[grepl(paste0("V1_", suffix, "$"), available_names[idx3], ignore.case = TRUE)]
+    if (length(exact_match) > 0) return(available_names[exact_match[1]])
+    return(available_names[idx3[1]])
+  }
+  return(NA_character_)
+}
+
+available_c6_names <- names(c6_onc_list)
+
+# Match all targets
+matched_list <- list()
+cat("   Pathway name matching:\n")
+for (t in targets) {
+  matched <- find_c6_pathway_name(t$search, available_c6_names)
+  matched_list[[t$search]] <- matched
+  status <- if (!is.na(matched)) "FOUND" else "NOT FOUND"
+  actual <- if (!is.na(matched)) matched else "---"
+  cat(sprintf("     %-30s -> %-30s [%s]\n", t$search, actual, status))
+}
+cat("\n")
+
+
+# ============================================================
+# 9h.9 BARPLOT: 6 SELECTED C6 SIGNATURES
+# ============================================================
+
+cat("   Generating C6 barplot (6 selected signatures)...\n")
+
+# Collect GSEA stats for the 6 signatures
+barplot_data <- data.frame()
+for (t in targets) {
+  actual_name <- matched_list[[t$search]]
+  if (is.na(actual_name)) next
+
+  gsea_row <- c6_gsea_dual[c6_gsea_dual$pathway == actual_name, ]
+  if (nrow(gsea_row) == 0) next
+
+  # Create clean display name
+  display_name <- actual_name
+  display_name <- gsub("_", " ", display_name)
+  display_name <- gsub("\\.", " ", display_name)
+
+  barplot_data <- rbind(barplot_data, data.frame(
+    pathway       = actual_name,
+    pathway_short = display_name,
+    NES           = gsea_row$NES[1],
+    padj          = gsea_row$padj[1],
+    pval          = gsea_row$pval[1],
+    size          = gsea_row$size[1],
+    stringsAsFactors = FALSE
+  ))
+}
+
+if (nrow(barplot_data) > 0) {
+  # Order by NES for visual clarity
+  barplot_data <- barplot_data[order(barplot_data$NES), ]
+  barplot_data$pathway_short <- factor(barplot_data$pathway_short,
+                                       levels = barplot_data$pathway_short)
+
+  # Color by direction: negative NES = blue, positive NES = red
+  barplot_data$direction <- ifelse(barplot_data$NES > 0, "Positive", "Negative")
+
+  # Build barplot
+  bar_p <- ggplot(barplot_data, aes(x = NES, y = pathway_short, fill = direction)) +
+    geom_col(width = 0.7, show.legend = FALSE) +
+    scale_fill_manual(values = c("Negative" = "#2166AC", "Positive" = "#B2182B")) +
+    # Add NES labels at end of each bar
+    geom_text(aes(label = sprintf("%.2f", NES),
+                  hjust = ifelse(NES > 0, -0.15, 1.15)),
+              size = 3.5, fontface = "bold") +
+    # Add padj labels
+    geom_text(aes(x = 0,
+                  label = sprintf("Padj=%.2e", padj)),
+              size = 3, color = "grey40", hjust = 0.5, vjust = -0.8) +
+    geom_vline(xintercept = 0, linewidth = 0.5, color = "black") +
+    labs(
+      title    = "GSEA C6 Oncogenic Signatures: sgTsgM vs SC",
+      subtitle = "Selected signatures related to RAS/MAPK, PRC2, and stemness programs",
+      x        = "Normalized Enrichment Score (NES)",
+      y        = NULL
+    ) +
+    # Expand x-axis to accommodate labels
+    scale_x_continuous(expand = expansion(mult = c(0.3, 0.3))) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+      axis.text.y   = element_text(size = 10),
+      axis.text.x   = element_text(size = 10),
+      axis.title.x  = element_text(size = 11),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor   = element_blank()
+    )
+
+  barplot_path <- file.path(OUTPUT_C6_DIR, "GSEA_barplot_C6_Oncogenic_sgTsgM_vs_SC.pdf")
+  ggsave(barplot_path, bar_p, width = 12, height = 5)
+  cat(sprintf("   [SAVED] %s\n\n", basename(barplot_path)))
+
+} else {
+  cat("   [WARN] No matching signatures found for barplot.\n\n")
+}
+
+
+# ============================================================
+# 9h.10 INDIVIDUAL ENRICHMENT PDFs
+# ============================================================
+
+cat("   Generating individual enrichment PDFs...\n\n")
+
+for (t in targets) {
+  actual_name <- matched_list[[t$search]]
+
+  if (is.na(actual_name)) {
+    cat(sprintf("     [SKIP] %s --- not found\n", t$search))
+    next
+  }
+
+  gsea_row <- c6_gsea_dual[c6_gsea_dual$pathway == actual_name, ]
+  if (nrow(gsea_row) == 0) {
+    cat(sprintf("     [SKIP] %s --- not in fgsea results\n", actual_name))
+    next
+  }
+
+  nes_val  <- gsea_row$NES[1]
+  padj_val <- gsea_row$padj[1]
+
+  display_name <- gsub("_", " ", actual_name)
+  display_name <- gsub("\\.", " ", display_name)
+
+  enrich_data <- plotEnrichment(c6_onc_list[[actual_name]], gene_list_dual)$data
+  y_peak <- if (nes_val > 0) max(enrich_data$y) else min(enrich_data$y)
+
+  p <- plotEnrichment(c6_onc_list[[actual_name]], gene_list_dual) +
+    ggtitle(display_name) +
+    labs(subtitle = sprintf("sgTsgM vs SC   |   NES = %.2f   |   Padj = %.2e",
+                            nes_val, padj_val)) +
+    xlab("Rank in Ordered Gene List") +
+    ylab("Enrichment Score (ES)") +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey30"),
+      axis.title    = element_text(size = 12),
+      axis.text     = element_text(size = 10)
+    ) +
+    annotate("label",
+             x = length(gene_list_dual) * 0.75,
+             y = y_peak * 0.85,
+             label = sprintf("NES = %.2f\nPadj = %.2e", nes_val, padj_val),
+             size = 4, fontface = "bold",
+             fill = "white", alpha = 0.85,
+             label.size = 0.5, label.padding = unit(0.4, "lines"))
+
+  out_path <- file.path(OUTPUT_C6_DIR, t$outfile)
+  ggsave(out_path, p, width = 8, height = 5)
+  cat(sprintf("     [SAVED] %s  NES=%+.2f  Padj=%.2e\n", t$outfile, nes_val, padj_val))
+}
+
+
+# ============================================================
+# 9h.11 COMBINED MULTI-PAGE PDF
+# ============================================================
+
+cat("\n   Generating combined PDF...\n")
+
+combined_pdf <- file.path(OUTPUT_C6_DIR, "GSEA_C6_enrichment_sgTsgM_vs_SC_selected.pdf")
+pdf(combined_pdf, width = 8, height = 5)
+
+for (t in targets) {
+  actual_name <- matched_list[[t$search]]
+  if (is.na(actual_name)) next
+
+  gsea_row <- c6_gsea_dual[c6_gsea_dual$pathway == actual_name, ]
+  if (nrow(gsea_row) == 0) next
+
+  nes_val  <- gsea_row$NES[1]
+  padj_val <- gsea_row$padj[1]
+
+  display_name <- gsub("_", " ", actual_name)
+  display_name <- gsub("\\.", " ", display_name)
+
+  enrich_data <- plotEnrichment(c6_onc_list[[actual_name]], gene_list_dual)$data
+  y_peak <- if (nes_val > 0) max(enrich_data$y) else min(enrich_data$y)
+
+  p <- plotEnrichment(c6_onc_list[[actual_name]], gene_list_dual) +
+    ggtitle(display_name) +
+    labs(subtitle = sprintf("sgTsgM vs SC   |   NES = %.2f   |   Padj = %.2e",
+                            nes_val, padj_val)) +
+    xlab("Rank in Ordered Gene List") +
+    ylab("Enrichment Score (ES)") +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey30"),
+      axis.title    = element_text(size = 12),
+      axis.text     = element_text(size = 10)
+    ) +
+    annotate("label",
+             x = length(gene_list_dual) * 0.75,
+             y = y_peak * 0.85,
+             label = sprintf("NES = %.2f\nPadj = %.2e", nes_val, padj_val),
+             size = 4, fontface = "bold",
+             fill = "white", alpha = 0.85,
+             label.size = 0.5, label.padding = unit(0.4, "lines"))
+
+  print(p)
+}
+
+dev.off()
+cat(sprintf("   [SAVED] %s\n", basename(combined_pdf)))
+
+
+# ============================================================
+# 9h.12 SUMMARY CSV
+# ============================================================
+
+summary_rows <- data.frame()
+for (t in targets) {
+  actual_name <- matched_list[[t$search]]
+  if (is.na(actual_name)) next
+  gsea_row <- c6_gsea_dual[c6_gsea_dual$pathway == actual_name, ]
+  if (nrow(gsea_row) == 0) next
+  le_text <- paste(gsea_row$leadingEdge[[1]], collapse = "; ")
+  summary_rows <- rbind(summary_rows, data.frame(
+    Pathway = actual_name, NES = round(gsea_row$NES[1], 3),
+    pval = signif(gsea_row$pval[1], 4), padj = signif(gsea_row$padj[1], 4),
+    size = gsea_row$size[1], leadingEdge = le_text,
+    output_file = t$outfile, stringsAsFactors = FALSE))
+}
+write.csv(summary_rows,
+          file.path(OUTPUT_C6_DIR, "GSEA_C6_selected_signatures_sgTsgM_vs_SC.csv"),
+          row.names = FALSE)
+
+cat("\n   === SUMMARY ===\n")
+for (j in seq_len(nrow(summary_rows))) {
+  cat(sprintf("     %-30s  NES=%+.2f  padj=%.2e  size=%d\n",
+              summary_rows$Pathway[j], summary_rows$NES[j],
+              summary_rows$padj[j], summary_rows$size[j]))
+}
+
+cat("\n   All output files:\n")
+cat(sprintf("     %s\n", OUTPUT_C6_DIR))
+cat(sprintf("       GSEA_barplot_C6_Oncogenic_sgTsgM_vs_SC.pdf\n"))
+for (t in targets) cat(sprintf("       %s\n", t$outfile))
+cat(sprintf("       GSEA_C6_enrichment_sgTsgM_vs_SC_selected.pdf\n"))
+cat(sprintf("       GSEA_C6_selected_signatures_sgTsgM_vs_SC.csv\n"))
+
+cat("\n   9h complete.\n\n")
+
+# ============================================================
+# 9i. C2 CURATED: 8 NE-REGULATING SIGNATURES — sgTsgM_vs_SC
+# ============================================================
+
+cat("   9i. Generating C2 Curated NE-regulating enrichment plots (sgTsgM_vs_SC)...\n\n")
+
+OUTPUT_C2_DIR <- file.path(GSEA_DIR, "C2_Curated")
+dir.create(OUTPUT_C2_DIR, recursive = TRUE, showWarnings = FALSE)
+
+OUTPUT_C2_ICLOUD <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/Bulk mRNA seq ADMSC Crispr 22Rv1 tumor/05_GSEA_Hallmarks/C2_Curated"
+dir.create(OUTPUT_C2_ICLOUD, recursive = TRUE, showWarnings = FALSE)
+
+c2_gsea_dual <- gsea_results_by_coll[["sgTsgM_vs_SC"]][["C2_Curated"]]
+available_c2_names <- names(c2_cp_list)
+
+cat(sprintf("   Ranked gene list: %d genes\n", length(gene_list_dual)))
+cat(sprintf("   C2 gene sets: %d\n", length(c2_cp_list)))
+cat(sprintf("   C2 GSEA results: %d pathways tested\n\n", nrow(c2_gsea_dual)))
+
+c2_targets <- list(
+  list(search  = "PID_HIF1_TFPATHWAY",
+       outfile = "GSEA_enrichment_PID_HIF1_TFPATHWAY_sgTsgM_vs_SC.pdf",
+       role    = "HIF1A convergence: glycolytic switch + NE gene expression",
+       ref     = "Spandidos 2026; Cells 2024"),
+  list(search  = "REACTOME_HSP90_CHAPERONE_CYCLE_FOR_STEROID_HORMONE_RECEPTORS_SHR_IN_THE_PRESENCE_OF_LIGAND",
+       outfile = "GSEA_enrichment_HSP90_CHAPERONE_CYCLE_FOR_SHR_sgTsgM_vs_SC.pdf",
+       role    = "AR protein folding: gatekeeper against NE switch",
+       ref     = "Beltran 2016, 2020"),
+  list(search  = "REACTOME_MITOCHONDRIAL_TRANSLATION_ELONGATION",
+       outfile = "GSEA_enrichment_MITOCHONDRIAL_TRANSLATION_ELONGATION_sgTsgM_vs_SC.pdf",
+       role    = "OXPHOS: adenocarcinoma metabolism vs NE glycolytic switch",
+       ref     = "PGC-1a/OXPHOS bioRxiv 2024; UPRmt Oncogene 2024"),
+  list(search  = "KEGG_ALLOGRAFT_REJECTION",
+       outfile = "GSEA_enrichment_ALLOGRAFT_REJECTION_sgTsgM_vs_SC.pdf",
+       role    = "NF-kB/inflammatory signaling: IL-6/STAT3 drives NE TFs",
+       ref     = "IL-6/STAT3/NEPC IJMS 2023"),
+  list(search  = "REACTOME_PROCESSING_AND_ACTIVATION_OF_SUMO",
+       outfile = "GSEA_enrichment_PROCESSING_AND_ACTIVATION_OF_SUMO_sgTsgM_vs_SC.pdf",
+       role    = "SUMOylation of AR/EZH2/HIF1A: enables lineage plasticity",
+       ref     = "EZH2 SUMOylation Cancer Res 2023"),
+  list(search  = "REACTOME_HSF1_DEPENDENT_TRANSACTIVATION",
+       outfile = "GSEA_enrichment_HSF1_DEPENDENT_TRANSACTIVATION_sgTsgM_vs_SC.pdf",
+       role    = "HSF1 stress response: proteostasis during cell-fate switching",
+       ref     = "HSF1/HSP90 axis in therapy resistance"),
+  list(search  = "REACTOME_COOPERATION_OF_PREFOLDIN_AND_TRIC_CCT_IN_ACTIN_AND_TUBULIN_FOLDING",
+       outfile = "GSEA_enrichment_PREFOLDIN_TRIC_CCT_FOLDING_sgTsgM_vs_SC.pdf",
+       role    = "Cytoskeletal remodeling: NE neurite-like processes",
+       ref     = "Tubulin isoform switching in NE cells"),
+  list(search  = "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT",
+       outfile = "GSEA_enrichment_RESPIRATORY_ELECTRON_TRANSPORT_sgTsgM_vs_SC.pdf",
+       role    = "ETC complex activity: OXPHOS-dependent adenocarcinoma state",
+       ref     = "Mitochondrial targeting NEPC Clin Cancer Res 2025")
+)
+
+find_c2_pathway_name <- function(target_name, available_names) {
+  if (target_name %in% available_names) return(target_name)
+  idx <- which(tolower(available_names) == tolower(target_name))
+  if (length(idx) > 0) return(available_names[idx[1]])
+  idx <- grep(target_name, available_names, fixed = TRUE)
+  if (length(idx) > 0) return(available_names[idx[1]])
+  idx <- grep(target_name, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx) > 0) return(available_names[idx[1]])
+  alt <- gsub("_", ".", target_name)
+  idx <- grep(alt, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx) > 0) return(available_names[idx[1]])
+  core <- gsub("^(REACTOME_|KEGG_|PID_|WP_|BIOCARTA_)", "", target_name)
+  idx <- grep(core, available_names, ignore.case = TRUE, fixed = TRUE)
+  if (length(idx) > 0) return(available_names[idx[1]])
+  return(NA_character_)
+}
+
+c2_matched <- list()
+cat("   Pathway name matching (C2 Curated):\n")
+for (t in c2_targets) {
+  matched <- find_c2_pathway_name(t$search, available_c2_names)
+  c2_matched[[t$search]] <- matched
+  status <- if (!is.na(matched)) "FOUND" else "NOT FOUND"
+  cat(sprintf("     %-70s [%s]\n", t$search, status))
+  if (!is.na(matched) && matched != t$search) cat(sprintf("       -> %s\n", matched))
+}
+cat("\n")
+
+
+# ============================================================
+# 9i.A  BUILD DATA FOR ALL MATCHED PATHWAYS
+# ============================================================
+
+c2_plot_data <- list()
+for (t in c2_targets) {
+  actual_name <- c2_matched[[t$search]]
+  if (is.na(actual_name)) next
+  gsea_row <- c2_gsea_dual[c2_gsea_dual$pathway == actual_name, ]
+  if (nrow(gsea_row) == 0) next
+  c2_plot_data[[t$search]] <- list(
+    actual_name  = actual_name,
+    nes          = gsea_row$NES[1],
+    padj         = gsea_row$padj[1],
+    pval         = gsea_row$pval[1],
+    size         = gsea_row$size[1],
+    role         = t$role,
+    ref          = t$ref,
+    outfile      = t$outfile,
+    leading_edge = gsea_row$leadingEdge[[1]]
+  )
+}
+
+cat(sprintf("   Matched %d / %d target pathways.\n\n", length(c2_plot_data), length(c2_targets)))
+
+
+# ============================================================
+# HELPER: Build enrichment plot with NES/padj in corner
+# ============================================================
+# Positive NES -> annotation at TOP-RIGHT corner
+# Negative NES -> annotation at BOTTOM-LEFT corner
+# Uses Inf/-Inf positioning with hjust/vjust to anchor text
+# exactly in the corner of the plot panel, guaranteeing no
+# overlap with the enrichment curve or rug marks.
+
+build_enrichment_plot <- function(gene_set, stats, nes_val, padj_val,
+                                  size_val, title_text, subtitle_text) {
+
+  # --- Get enrichment curve ---
+  enrich_obj <- plotEnrichment(gene_set, stats)
+
+  n_genes <- length(stats)
+
+  # --- Build stat label ---
+  stat_label <- sprintf("NES = %+.2f\nPadj = %.2e\nn = %d genes",
+                         nes_val, padj_val, size_val)
+  nes_color <- ifelse(nes_val > 0, "#B2182B", "#2166AC")
+
+  # --- Position: corner placement using Inf/-Inf ---
+  # Positive NES: top-right corner
+  #   x = +Inf (right edge), y = +Inf (top edge)
+  #   hjust = 1 (text right-aligned to x), vjust = 1 (text top-aligned to y)
+  #   Small inset via nudge to avoid touching the axis frame
+  #
+  # Negative NES: bottom-left corner
+  #   x = -Inf (left edge), y = -Inf (bottom edge)
+  #   hjust = 0 (text left-aligned to x), vjust = 0 (text bottom-aligned to y)
+
+  if (nes_val > 0) {
+    annot_x     <- Inf
+    annot_y     <- Inf
+    annot_hjust <- 1.05   # slight inset from right frame
+    annot_vjust <- 1.15   # slight inset from top frame
+  } else {
+    annot_x     <- -Inf
+    annot_y     <- -Inf
+    annot_hjust <- -0.05  # slight inset from left frame
+    annot_vjust <- -0.15  # slight inset from bottom frame
+  }
+
+  # --- Build plot ---
+  p <- enrich_obj +
+    ggtitle(title_text) +
+    labs(subtitle = subtitle_text) +
+    xlab("Rank in Ordered Gene List") +
+    ylab("Enrichment Score (ES)") +
+    annotate("text",
+             x     = annot_x,
+             y     = annot_y,
+             label = stat_label,
+             size  = 4.0,
+             fontface   = "bold",
+             color      = nes_color,
+             hjust      = annot_hjust,
+             vjust      = annot_vjust,
+             lineheight = 1.15) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey30"),
+      axis.title    = element_text(size = 12),
+      axis.text     = element_text(size = 10),
+      plot.margin   = margin(t = 10, r = 15, b = 10, l = 10, unit = "pt")
+    )
+
+  return(p)
+}
+
+
+# ============================================================
+# 9i.B  COMPREHENSIVE SINGLE PDF REPORT
+# ============================================================
+
+report_pdf <- file.path(OUTPUT_C2_DIR,
+  "GSEA_C2_NE_pathways_sgTsgM_vs_SC_REPORT.pdf")
+
+cat(sprintf("   Generating comprehensive PDF report: %s\n", basename(report_pdf)))
+
+pdf(report_pdf, width = 11, height = 8.5,
+    title = "C2 Curated NE-Regulating Pathways: sgTsgM vs SC")
+
+# ---- PAGE 1: TITLE PAGE ----
+par(mar = c(0, 0, 0, 0))
+plot.new()
+text(0.5, 0.82, "GSEA C2 Curated Pathway Analysis", cex = 2.2, font = 2)
+text(0.5, 0.72, "Pathways Regulating Neuroendocrine Differentiation", cex = 1.6, font = 3)
+text(0.5, 0.60, "sgTNFSF12+sgMDK Dual KO ADMSC + 22Rv1", cex = 1.3, font = 1)
+text(0.5, 0.54, "vs", cex = 1.1, font = 1, col = "grey40")
+text(0.5, 0.48, "sgScramble ADMSC + 22Rv1", cex = 1.3, font = 1)
+text(0.5, 0.35, sprintf("8 Curated Pathways  |  %d Genes Ranked  |  %d C2 Gene Sets Tested",
+                         length(gene_list_dual), length(c2_cp_list)), cex = 1.0, col = "grey30")
+text(0.5, 0.22, sprintf("Generated: %s", Sys.Date()), cex = 0.9, col = "grey50")
+text(0.5, 0.16, "Bulk mRNA-seq Pipeline: ADMSC CRISPR x 22Rv1 Tumors", cex = 0.9, col = "grey50")
+
+# ---- PAGE 2: BARPLOT ----
+barplot_c2 <- data.frame()
+for (key in names(c2_plot_data)) {
+  d <- c2_plot_data[[key]]
+  display_name <- gsub("^REACTOME_|^KEGG_|^PID_|^WP_|^BIOCARTA_", "", d$actual_name)
+  display_name <- gsub("_", " ", display_name)
+  if (nchar(display_name) > 55) display_name <- paste0(substr(display_name, 1, 52), "...")
+  barplot_c2 <- rbind(barplot_c2, data.frame(
+    pathway = d$actual_name, pathway_short = display_name,
+    NES = d$nes, padj = d$padj, pval = d$pval, size = d$size,
+    role = d$role, stringsAsFactors = FALSE))
+}
+
+if (nrow(barplot_c2) > 0) {
+  barplot_c2 <- barplot_c2[order(barplot_c2$NES), ]
+  barplot_c2$pathway_short <- factor(barplot_c2$pathway_short, levels = barplot_c2$pathway_short)
+  barplot_c2$direction <- ifelse(barplot_c2$NES > 0, "Restored in Dual KO",
+                                  "Active with TNFSF12/MDK")
+
+  bar_c2 <- ggplot(barplot_c2, aes(x = NES, y = pathway_short, fill = direction)) +
+    geom_col(width = 0.7) +
+    scale_fill_manual(values = c("Active with TNFSF12/MDK" = "#2166AC",
+                                  "Restored in Dual KO" = "#B2182B"), name = "Direction") +
+    geom_text(aes(label = sprintf("%.2f", NES),
+                  hjust = ifelse(NES > 0, -0.15, 1.15)), size = 3.5, fontface = "bold") +
+    geom_text(aes(x = 0, label = sprintf("Padj = %.2e", padj)),
+              size = 2.8, color = "grey40", hjust = 0.5, vjust = -0.8) +
+    geom_vline(xintercept = 0, linewidth = 0.5, color = "black") +
+    labs(title = "C2 Curated Pathways Regulating Neuroendocrine Differentiation",
+         subtitle = "sgTNFSF12+sgMDK Dual KO ADMSC + 22Rv1 vs sgScramble ADMSC + 22Rv1",
+         x = "Normalized Enrichment Score (NES)", y = NULL) +
+    scale_x_continuous(expand = expansion(mult = c(0.3, 0.3))) +
+    theme_bw(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+          axis.text.y = element_text(size = 9), axis.text.x = element_text(size = 10),
+          axis.title.x = element_text(size = 11), legend.position = "bottom",
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+  print(bar_c2)
+}
+
+# ---- PAGES 3-10: INDIVIDUAL ENRICHMENT PLOTS ----
+for (key in names(c2_plot_data)) {
+  d <- c2_plot_data[[key]]
+  display_name <- gsub("^REACTOME_|^KEGG_|^PID_", "", d$actual_name)
+  display_name <- gsub("_", " ", display_name)
+  subtitle_text <- sprintf("sgTsgM vs SC\n%s", d$role)
+  p <- build_enrichment_plot(
+    gene_set = c2_cp_list[[d$actual_name]], stats = gene_list_dual,
+    nes_val = d$nes, padj_val = d$padj, size_val = d$size,
+    title_text = display_name, subtitle_text = subtitle_text)
+  print(p)
+}
+
+# ---- FINAL PAGE: SUMMARY TABLE ----
+par(mar = c(2, 2, 4, 2))
+plot.new()
+text(0.5, 0.95, "Summary: C2 NE-Regulating Pathways", cex = 1.5, font = 2)
+y_start <- 0.87; line_h <- 0.065
+text(0.03, y_start, "Rank", cex = 0.8, font = 2, adj = 0)
+text(0.10, y_start, "Pathway", cex = 0.8, font = 2, adj = 0)
+text(0.58, y_start, "NES", cex = 0.8, font = 2, adj = 0)
+text(0.67, y_start, "Padj", cex = 0.8, font = 2, adj = 0)
+text(0.80, y_start, "Direction", cex = 0.8, font = 2, adj = 0)
+segments(0.02, y_start - 0.015, 0.98, y_start - 0.015, lwd = 1.5)
+row_i <- 0
+for (key in names(c2_plot_data)) {
+  d <- c2_plot_data[[key]]; row_i <- row_i + 1
+  y_pos <- y_start - row_i * line_h
+  short_name <- gsub("^REACTOME_|^KEGG_|^PID_", "", d$actual_name)
+  short_name <- gsub("_", " ", short_name)
+  if (nchar(short_name) > 50) short_name <- paste0(substr(short_name, 1, 47), "...")
+  dir_label <- ifelse(d$nes > 0, "Restored in Dual KO", "Active with TNFSF12/MDK")
+  dir_color <- ifelse(d$nes > 0, "#B2182B", "#2166AC")
+  text(0.03, y_pos, row_i, cex = 0.75, adj = 0)
+  text(0.10, y_pos, short_name, cex = 0.7, adj = 0)
+  text(0.58, y_pos, sprintf("%+.2f", d$nes), cex = 0.75, adj = 0, font = 2, col = dir_color)
+  text(0.67, y_pos, sprintf("%.2e", d$padj), cex = 0.7, adj = 0)
+  text(0.80, y_pos, dir_label, cex = 0.65, adj = 0, col = dir_color)
+}
+segments(0.02, y_start - (row_i + 0.5) * line_h, 0.98,
+         y_start - (row_i + 0.5) * line_h, lwd = 0.5, col = "grey60")
+text(0.5, y_start - (row_i + 1.2) * line_h,
+     sprintf("Negative NES: active with TNFSF12/MDK (lost in dual KO): %d pathways",
+             sum(barplot_c2$NES < 0)), cex = 0.8, col = "#2166AC")
+text(0.5, y_start - (row_i + 1.8) * line_h,
+     sprintf("Positive NES: restored in dual KO: %d pathways",
+             sum(barplot_c2$NES > 0)), cex = 0.8, col = "#B2182B")
+text(0.5, 0.05, sprintf("Contrast: sgTsgM_vs_SC  |  %d genes ranked  |  Generated %s",
+                         length(gene_list_dual), Sys.Date()), cex = 0.7, col = "grey50")
+
+dev.off()
+cat(sprintf("   [SAVED] %s\n", basename(report_pdf)))
+file.copy(report_pdf, file.path(OUTPUT_C2_ICLOUD, basename(report_pdf)), overwrite = TRUE)
+cat(sprintf("   [COPIED] -> %s\n\n", OUTPUT_C2_ICLOUD))
+
+
+# ============================================================
+# 9i.C  INDIVIDUAL PDFs
+# ============================================================
+
+cat("   Generating individual C2 enrichment PDFs...\n\n")
+
+for (key in names(c2_plot_data)) {
+  d <- c2_plot_data[[key]]
+  t_match <- Filter(function(t) t$search == key, c2_targets)[[1]]
+  display_name <- gsub("^REACTOME_|^KEGG_|^PID_", "", d$actual_name)
+  display_name <- gsub("_", " ", display_name)
+  subtitle_text <- sprintf("sgTsgM vs SC\n%s", d$role)
+  p <- build_enrichment_plot(
+    gene_set = c2_cp_list[[d$actual_name]], stats = gene_list_dual,
+    nes_val = d$nes, padj_val = d$padj, size_val = d$size,
+    title_text = display_name, subtitle_text = subtitle_text)
+  out_path <- file.path(OUTPUT_C2_DIR, t_match$outfile)
+  ggsave(out_path, p, width = 10, height = 6)
+  file.copy(out_path, file.path(OUTPUT_C2_ICLOUD, t_match$outfile), overwrite = TRUE)
+  cat(sprintf("     [SAVED] %-55s NES=%+.2f  Padj=%.2e\n",
+              t_match$outfile, d$nes, d$padj))
+}
+
+
+# ============================================================
+# 9i.D  SUMMARY CSV
+# ============================================================
+
+cat("\n   Generating C2 NE-pathway summary CSV...\n")
+
+c2_summary <- data.frame()
+for (key in names(c2_plot_data)) {
+  d <- c2_plot_data[[key]]
+  t_match <- Filter(function(t) t$search == key, c2_targets)[[1]]
+  c2_summary <- rbind(c2_summary, data.frame(
+    Rank = nrow(c2_summary) + 1, Pathway = d$actual_name,
+    NES = round(d$nes, 3), pval = signif(d$pval, 4),
+    padj = signif(d$padj, 4), size = d$size,
+    NE_Role = d$role, Reference = d$ref,
+    Direction = ifelse(d$nes > 0, "UP in Dual KO (restored)",
+                        "DOWN in Dual KO (lost without TNFSF12/MDK)"),
+    Leading_Edge = paste(d$leading_edge, collapse = "; "),
+    Output_File = t_match$outfile, stringsAsFactors = FALSE))
+}
+
+csv_path <- file.path(OUTPUT_C2_DIR, "GSEA_C2_NE_pathways_sgTsgM_vs_SC_summary.csv")
+write.csv(c2_summary, csv_path, row.names = FALSE)
+file.copy(csv_path, file.path(OUTPUT_C2_ICLOUD, basename(csv_path)), overwrite = TRUE)
+
+cat("\n   === C2 CURATED: NE-REGULATING PATHWAYS SUMMARY ===\n\n")
+cat(sprintf("   %-4s %-55s %7s %10s %s\n", "Rank", "Pathway", "NES", "Padj", "Direction"))
+cat(sprintf("   %s\n", paste(rep("-", 105), collapse = "")))
+for (j in seq_len(nrow(c2_summary))) {
+  short_name <- gsub("^REACTOME_|^KEGG_|^PID_", "", c2_summary$Pathway[j])
+  short_name <- gsub("_", " ", short_name)
+  if (nchar(short_name) > 53) short_name <- paste0(substr(short_name, 1, 50), "...")
+  cat(sprintf("   %-4d %-55s %+7.2f %10.2e %s\n",
+              c2_summary$Rank[j], short_name, c2_summary$NES[j],
+              c2_summary$padj[j], c2_summary$Direction[j]))
+}
+cat(sprintf("\n   Negative NES (active with TNFSF12/MDK, lost in KO): %d pathways\n",
+            sum(c2_summary$NES < 0)))
+cat(sprintf("   Positive NES (restored in dual KO):                 %d pathways\n",
+            sum(c2_summary$NES > 0)))
+
+cat("\n   === OUTPUT FILES ===\n")
+cat(sprintf("   Processing: %s\n", OUTPUT_C2_DIR))
+cat(sprintf("   iCloud:     %s\n\n", OUTPUT_C2_ICLOUD))
+cat(sprintf("     %-65s [report]\n", "GSEA_C2_NE_pathways_sgTsgM_vs_SC_REPORT.pdf"))
+for (key in names(c2_plot_data)) {
+  t_match <- Filter(function(t) t$search == key, c2_targets)[[1]]
+  cat(sprintf("     %-65s [individual]\n", t_match$outfile))
+}
+cat(sprintf("     %-65s [data]\n", "GSEA_C2_NE_pathways_sgTsgM_vs_SC_summary.csv"))
+cat("\n   9i. C2 Curated NE-regulating pathway analysis complete.\n\n")
+
+# ============================================================
+# 10. INTEGRATED PATHWAY SUMMARY
+# ============================================================
+
+cat(">> Step 10: Integrated pathway summary...\n\n")
+
+key_contrasts <- c("sgT_vs_SC","sgM_vs_SC","sgTsgM_vs_SC")
+
+all_pathway_names <- names(all_gene_sets)
+combined_nes <- data.frame(pathway = all_pathway_names, stringsAsFactors = FALSE)
+for (cc in key_contrasts) {
+  if (cc %in% names(gsea_results_all)) {
+    gd <- as.data.frame(gsea_results_all[[cc]])
+    combined_nes[[paste0("NES_", cc)]] <- gd$NES[match(combined_nes$pathway, gd$pathway)]
+    combined_nes[[paste0("padj_", cc)]] <- gd$padj[match(combined_nes$pathway, gd$pathway)]
+  }
+}
+write.csv(combined_nes, file.path(GSEA_DIR, "GSEA_ALL_combined_NES.csv"), row.names = FALSE)
+
+nes_matrix <- combined_nes[, grep("^NES_", colnames(combined_nes))]
+rownames(nes_matrix) <- combined_nes$pathway
+colnames(nes_matrix) <- gsub("^NES_", "", colnames(nes_matrix))
+
+display_names <- combined_nes$pathway
+display_names <- gsub("^HALLMARK_", "H:", display_names)
+display_names <- gsub("^CUSTOM_", "* ", display_names)
+display_names <- gsub("^GOBP_|^GOCC_|^GOMF_", "GO:", display_names)
+display_names <- gsub("^KEGG_MEDICUS_|^KEGG_LEGACY_|^KEGG_", "KEGG:", display_names)
+display_names <- gsub("^REACTOME_", "R:", display_names)
+display_names <- gsub("^WP_", "WP:", display_names)
+display_names <- gsub("^PID_", "PID:", display_names)
+display_names <- gsub("^BIOCARTA_", "BC:", display_names)
+
+padj_matrix <- combined_nes[, grep("^padj_", colnames(combined_nes))]
+sig_in_any <- apply(padj_matrix, 1, function(x) any(x < 0.25, na.rm = TRUE))
+hc_pathway_names <- c(names(hallmark_list), names(custom_gene_sets))
+
+# Hallmark + Custom heatmap
+hc_sig <- sig_in_any & (combined_nes$pathway %in% hc_pathway_names)
+nes_hc <- nes_matrix[hc_sig, , drop = FALSE]
+if (nrow(nes_hc) > 0) {
+  hc_disp <- display_names[hc_sig]
+  hc_disp <- make_unique_display_names(hc_disp)
+  rownames(nes_hc) <- hc_disp
+  pdf(file.path(GSEA_DIR, "GSEA_Hallmark_Custom_NES_heatmap.pdf"),
+      width = 12, height = max(8, nrow(nes_hc) * 0.3 + 2))
+  pheatmap(as.matrix(nes_hc), cluster_cols = FALSE, cluster_rows = TRUE,
+    color = colorRampPalette(c("blue","white","red"))(100), breaks = seq(-3, 3, length.out = 101),
+    main = "NES: Hallmark + Custom", fontsize_row = 9, fontsize_col = 11,
+    border_color = NA, display_numbers = TRUE, number_format = "%.2f")
+  dev.off()
+}
+
+# Per-collection heatmaps
+for (coll_name in names(gsea_collections)) {
+  ci <- combined_nes$pathway %in% names(gsea_collections[[coll_name]])
+  csi <- sig_in_any & ci; nc <- nes_matrix[csi, , drop = FALSE]
+  if (nrow(nc) > 0 && nrow(nc) <= 80) {
+    cd <- display_names[csi]
+    cd <- ifelse(nchar(cd) > 50, paste0(substr(cd, 1, 47), "..."), cd)
+    cd <- make_unique_display_names(cd)
+    rownames(nc) <- cd
+    pdf(file.path(GSEA_DIR, coll_name, paste0("GSEA_NES_heatmap_", coll_name, ".pdf")),
+        width = 13, height = max(8, nrow(nc) * 0.25 + 2))
+    pheatmap(as.matrix(nc), cluster_cols = FALSE, cluster_rows = TRUE,
+      color = colorRampPalette(c("blue","white","red"))(100), breaks = seq(-3, 3, length.out = 101),
+      main = paste0("NES: ", coll_name), fontsize_row = 7, fontsize_col = 11,
+      border_color = NA, display_numbers = TRUE, number_format = "%.1f")
+    dev.off()
+  } else if (nrow(nc) > 80) {
+    pc <- padj_matrix[csi, , drop = FALSE]
+    mp <- apply(pc, 1, function(x) min(x, na.rm = TRUE))
+    t50 <- order(mp)[1:min(50, length(mp))]
+    nt <- nc[t50, , drop = FALSE]
+    dt <- display_names[csi][t50]
+    dt <- ifelse(nchar(dt) > 50, paste0(substr(dt, 1, 47), "..."), dt)
+    dt <- make_unique_display_names(dt)
+    rownames(nt) <- dt
+    pdf(file.path(GSEA_DIR, coll_name, paste0("GSEA_NES_heatmap_top50_", coll_name, ".pdf")),
+        width = 13, height = max(8, 50 * 0.25 + 2))
+    pheatmap(as.matrix(nt), cluster_cols = FALSE, cluster_rows = TRUE,
+      color = colorRampPalette(c("blue","white","red"))(100), breaks = seq(-3, 3, length.out = 101),
+      main = paste0("NES: ", coll_name, " (Top 50)"), fontsize_row = 7, fontsize_col = 11,
+      border_color = NA, display_numbers = TRUE, number_format = "%.1f")
+    dev.off()
+  }
+}
+
+# Pathway classification
+cat("   === PATHWAY CLASSIFICATION ===\n\n")
+pathway_classification <- data.frame()
+for (i in seq_len(nrow(combined_nes))) {
+  pw <- combined_nes$pathway[i]
+  if (!(pw %in% hc_pathway_names)) next
+  ns <- combined_nes$NES_sgT_vs_SC[i]; nm <- combined_nes$NES_sgM_vs_SC[i]; nd <- combined_nes$NES_sgTsgM_vs_SC[i]
+  ps <- combined_nes$padj_sgT_vs_SC[i]; pm <- combined_nes$padj_sgM_vs_SC[i]; pd <- combined_nes$padj_sgTsgM_vs_SC[i]
+  ss <- !is.na(ps) && ps < 0.25; sm <- !is.na(pm) && pm < 0.25; sd <- !is.na(pd) && pd < 0.25
+
+  cl <- "Not significant"
+  if (ss && !sm) cl <- "TNFSF12-specific"
+  else if (!ss && sm) cl <- "MDK-specific"
+  else if (ss && sm && sd && !is.na(nd) && abs(nd) > max(abs(ns), abs(nm), na.rm = TRUE)) cl <- "Synergistic"
+  else if (ss && sm) cl <- "Shared"
+  else if (sd && !ss && !sm) cl <- "Dual-KO-specific"
+  if (cl == "Not significant") next
+
+  pd2 <- gsub("^HALLMARK_", "", pw); pd2 <- gsub("^CUSTOM_", "* ", pd2)
+  pathway_classification <- rbind(pathway_classification, data.frame(
+    Pathway = pd2, Pathway_ID = pw, Is_Custom = grepl("^CUSTOM_", pw), Classification = cl,
+    NES_sgT = round(ns, 3), NES_sgM = round(nm, 3), NES_dual = round(nd, 3),
+    padj_sgT = signif(ps, 3), padj_sgM = signif(pm, 3), padj_dual = signif(pd, 3),
+    stringsAsFactors = FALSE))
+}
+if (nrow(pathway_classification) > 0) {
+  pathway_classification <- pathway_classification[order(-pathway_classification$Is_Custom, pathway_classification$Classification), ]
+  print(pathway_classification[, c("Pathway","Classification","NES_sgT","NES_sgM","NES_dual")], row.names = FALSE)
+}
+write.csv(pathway_classification, file.path(GSEA_DIR, "Hallmark_Custom_pathway_classification.csv"), row.names = FALSE)
+
+
+# ============================================================
+# 11. EXCEL REPORT
+# ============================================================
+
+cat("\n>> Step 11: Excel report...\n")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Experiment_Design"); writeData(wb, "Experiment_Design", GROUP_INFO)
+addWorksheet(wb, "Sample_Info"); writeData(wb, "Sample_Info", SAMPLE_INFO)
+addWorksheet(wb, "CellChat_Receptors"); writeData(wb, "CellChat_Receptors", cellchat_summary)
+addWorksheet(wb, "Receptor_Stats"); writeData(wb, "Receptor_Stats", receptor_stats)
+
+hc_combined <- combined_nes[combined_nes$pathway %in% hc_pathway_names, ]
+addWorksheet(wb, "GSEA_HC_NES"); writeData(wb, "GSEA_HC_NES", hc_combined)
+addWorksheet(wb, "Pathway_Classification"); writeData(wb, "Pathway_Classification", pathway_classification)
+if (nrow(custom_summary) > 0) { addWorksheet(wb, "Custom_GSEA"); writeData(wb, "Custom_GSEA", custom_summary) }
+if (nrow(collection_top_summary) > 0) { addWorksheet(wb, "Top_by_Collection"); writeData(wb, "Top_by_Collection", collection_top_summary) }
+
+csr <- data.frame(Signature = rep(names(custom_gene_sets), sapply(custom_gene_sets, length)),
+  Gene = unlist(custom_gene_sets, use.names = FALSE), stringsAsFactors = FALSE)
+addWorksheet(wb, "Custom_Genes"); writeData(wb, "Custom_Genes", csr)
+
+ci <- data.frame(Collection = names(gsea_collections), N = sapply(gsea_collections, length), stringsAsFactors = FALSE)
+addWorksheet(wb, "MSigDB_Collections"); writeData(wb, "MSigDB_Collections", ci)
+
+for (cn in names(de_results)) {
+  sn <- substr(paste0("DE_", cn), 1, 31); addWorksheet(wb, sn)
+  rd <- as.data.frame(de_results[[cn]]); rd$gene <- rownames(rd); writeData(wb, sn, rd)
+}
+for (cn in names(gsea_results_all)) {
+  fh <- gsea_results_all[[cn]]; fh <- fh[fh$pathway %in% hc_pathway_names, ]
+  sn <- substr(paste0("GSEA_HC_", cn), 1, 31); addWorksheet(wb, sn)
+  gd <- as.data.frame(fh); gd$leadingEdge <- sapply(gd$leadingEdge, paste, collapse = "; ")
+  writeData(wb, sn, gd)
+}
+
+excel_on_ext <- file.path(WORK_DIR, "ADMSC_CRISPR_22Rv1_mRNAseq_Results.xlsx")
+saveWorkbook(wb, excel_on_ext, overwrite = TRUE)
+cat(sprintf("   Saved: %s\n", excel_on_ext))
+
+
+# ============================================================
+# 12. (Reserved)
+# ============================================================
+
+
+# ============================================================
+# 13. DECONVOLUTION (Level 1)
+# ============================================================
+
+cat("\n>> Step 13: Deconvolution...\n\n")
+
+DECONV_DIR <- file.path(WORK_DIR, "07_Deconvolution")
+dir.create(DECONV_DIR, recursive = TRUE, showWarnings = FALSE)
+
+ADMSC_MARKERS <- c("NT5E","THY1","ENG","PDGFRA","PDGFRB","COL1A1","COL1A2","COL3A1","COL5A1",
+  "FN1","VIM","ACTA2","FAP","DCN","LUM","PPARG","CEBPA","FABP4","ADIPOQ","LPL","PLIN1",
+  "TNFSF12","MDK","S100A4","TAGLN","MYL9","DES","SPARC","BGN")
+RV1_MARKERS <- c("AR","KLK3","KLK2","NKX3-1","TMPRSS2","FKBP5","HOXB13","KRT8","KRT18","KRT19",
+  "EPCAM","CDH1","PSCA","FOLH1","ACPP","SLC45A3","STEAP2","MKI67","TOP2A","PCNA","SYP","CHGA","ENO2","NCAM1")
+
+admsc_available <- ADMSC_MARKERS[ADMSC_MARKERS %in% rownames(norm_counts)]
+rv1_available <- RV1_MARKERS[RV1_MARKERS %in% rownames(norm_counts)]
+
+admsc_score <- colMeans(log2(norm_counts[admsc_available, , drop = FALSE] + 1))
+rv1_score <- colMeans(log2(norm_counts[rv1_available, , drop = FALSE] + 1))
+admsc_fraction <- admsc_score / (admsc_score + rv1_score)
+
+composition_df <- data.frame(sample = colnames(norm_counts), group = coldata[colnames(norm_counts),"group"],
+  ADMSC_score = round(admsc_score, 4), RV1_score = round(rv1_score, 4),
+  ADMSC_fraction = round(admsc_fraction, 4), RV1_fraction = round(1 - admsc_fraction, 4), stringsAsFactors = FALSE)
+write.csv(composition_df, file.path(DECONV_DIR, "estimated_cell_composition.csv"), row.names = FALSE)
+
+cl <- composition_df %>% select(sample, group, ADMSC_fraction, RV1_fraction) %>%
+  pivot_longer(c(ADMSC_fraction, RV1_fraction), names_to = "cell_type", values_to = "fraction") %>%
+  mutate(cell_type = gsub("_fraction", "", cell_type))
+cb <- ggplot(cl, aes(sample, fraction, fill = cell_type)) + geom_col(position = "stack") +
+  scale_fill_manual(values = c("ADMSC"="#FF7F0E","RV1"="#1F77B4")) +
+  labs(title = "Cell Composition", x = NULL, y = "Fraction") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(DECONV_DIR, "cell_composition_barplot.pdf"), cb, width = 10, height = 6)
+
+coldata_adj <- coldata; coldata_adj$admsc_fraction <- admsc_fraction[rownames(coldata_adj)]
+dds_adj <- DESeqDataSetFromMatrix(count_matrix[rownames(count_matrix) %in% rownames(dds), ],
+  coldata_adj, ~ admsc_fraction + group)
+keep_adj <- rowSums(counts(dds_adj) >= 10) >= 3; dds_adj <- dds_adj[keep_adj, ]; dds_adj <- DESeq(dds_adj)
+
+de_results_adj <- list()
+for (cn in names(contrasts_list)) {
+  ra <- results(dds_adj, contrast = contrasts_list[[cn]], alpha = PADJ_CUTOFF)
+  de_results_adj[[cn]] <- ra[order(ra$padj), ]
+  rd <- as.data.frame(de_results_adj[[cn]]); rd$gene <- rownames(rd)
+  write.csv(rd, file.path(DECONV_DIR, paste0("DEG_adjusted_", cn, ".csv")), row.names = FALSE)
+}
+
+gsea_results_adj <- list()
+for (cn in names(de_results_adj)) {
+  rd <- as.data.frame(de_results_adj[[cn]])
+  rd <- rd[!is.na(rd$log2FoldChange) & !is.na(rd$pvalue), ]
+  gl <- if ("stat" %in% colnames(rd)) rd$stat else rd$log2FoldChange
+  names(gl) <- rownames(rd); gl <- sort(gl, decreasing = TRUE)
+  fa <- fgsea(pathways = all_gene_sets, stats = gl, minSize = 2, maxSize = 500, nPermSimple = 10000)
+  gsea_results_adj[[cn]] <- fa[order(fa$padj), ]
+  fo <- as.data.frame(gsea_results_adj[[cn]]); fo$leadingEdge <- sapply(fo$leadingEdge, paste, collapse = "; ")
+  write.csv(fo, file.path(DECONV_DIR, paste0("GSEA_adjusted_", cn, ".csv")), row.names = FALSE)
+}
+
+concordance_results <- data.frame()
+for (cn in names(gsea_results_all)) {
+  od <- as.data.frame(gsea_results_all[[cn]]); ad <- as.data.frame(gsea_results_adj[[cn]])
+  m <- merge(od[,c("pathway","NES","padj")], ad[,c("pathway","NES","padj")], by = "pathway", suffixes = c("_orig","_adj"))
+  for (j in seq_len(nrow(m))) {
+    no <- m$NES_orig[j]; na_ <- m$NES_adj[j]; po <- m$padj_orig[j]; pa_ <- m$padj_adj[j]
+    so <- !is.na(po) && po < 0.25; sa <- !is.na(pa_) && pa_ < 0.25; ss <- sign(no) == sign(na_)
+    st <- if (so && sa && ss) "CONFIRMED" else if (so && !sa) "LOST" else
+      if (!so && sa) "GAINED" else if (so && sa && !ss) "REVERSED" else "NS_both"
+    concordance_results <- rbind(concordance_results, data.frame(
+      Contrast = cn, Pathway = m$pathway[j], NES_orig = round(no, 3), NES_adj = round(na_, 3),
+      padj_orig = signif(po, 3), padj_adj = signif(pa_, 3), Concordance = st, stringsAsFactors = FALSE))
+  }
+}
+write.csv(concordance_results, file.path(DECONV_DIR, "GSEA_concordance.csv"), row.names = FALSE)
+
+# CIBERSORTx
+CIBERSORT_DIR <- file.path(DECONV_DIR, "CIBERSORTx_input")
+dir.create(CIBERSORT_DIR, recursive = TRUE, showWarnings = FALSE)
+write.table(data.frame(Gene = rownames(norm_counts), norm_counts, check.names = FALSE),
+  file.path(CIBERSORT_DIR, "CIBERSORTx_mixture.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+sc_samples <- coldata$sample[coldata$group == "SC"]
+sig_genes <- unique(c(admsc_available, rv1_available))
+sig_genes <- sig_genes[sig_genes %in% rownames(norm_counts)]
+sm <- data.frame(Gene = sig_genes,
+  ADMSC = rowMeans(norm_counts[sig_genes, sc_samples, drop = FALSE]),
+  RV1 = rowMeans(norm_counts[sig_genes, sc_samples, drop = FALSE]), stringsAsFactors = FALSE)
+for (g in sig_genes) {
+  if (g %in% admsc_available) { sm$ADMSC[sm$Gene == g] <- sm$ADMSC[sm$Gene == g] * 1.5; sm$RV1[sm$Gene == g] <- sm$RV1[sm$Gene == g] * 0.5 }
+  if (g %in% rv1_available)   { sm$RV1[sm$Gene == g] <- sm$RV1[sm$Gene == g] * 1.5; sm$ADMSC[sm$Gene == g] <- sm$ADMSC[sm$Gene == g] * 0.5 }
+}
+write.table(sm, file.path(CIBERSORT_DIR, "CIBERSORTx_signature_matrix.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(data.frame(Sample = coldata$sample, Class = as.character(coldata$group)),
+  file.path(CIBERSORT_DIR, "CIBERSORTx_phenoclasses.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+# Marker heatmap
+all_markers <- c(admsc_available, rv1_available)
+mt <- data.frame(row.names = all_markers, CellType = ifelse(all_markers %in% admsc_available, "ADMSC", "22Rv1"))
+pdf(file.path(DECONV_DIR, "Marker_gene_heatmap.pdf"), width = 14, height = 12)
+pheatmap(log2(norm_counts[all_markers, , drop = FALSE] + 1),
+  annotation_col = ha_col, annotation_row = mt,
+  annotation_colors = c(ann_colors, list(CellType = c("ADMSC"="#FF7F0E","22Rv1"="#1F77B4"))),
+  scale = "row", main = "Marker Genes", fontsize_row = 7,
+  color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100))
+dev.off()
+cat("   Deconvolution complete.\n\n")
+
+
+# ============================================================
+# 14. TRIANGULATION (Level 2)
+# ============================================================
+
+cat(">> Step 14: Triangulation...\n\n")
+
+TRIANG_DIR <- file.path(WORK_DIR, "08_Triangulation")
+dir.create(TRIANG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+ADMSC_SPECIFIC <- c("COL1A1","COL1A2","COL3A1","COL5A1","FN1","VIM","ACTA2","FAP","DCN","LUM",
+  "PDGFRA","PDGFRB","THY1","ENG","NT5E","SPARC","BGN","S100A4","TAGLN","MYL9","DES",
+  "PPARG","CEBPA","FABP4","ADIPOQ","LPL","PLIN1","TNFSF12","MDK")
+RV1_SPECIFIC <- c("AR","KLK3","KLK2","NKX3-1","TMPRSS2","FKBP5","HOXB13","KRT8","KRT18","KRT19",
+  "EPCAM","CDH1","PSCA","FOLH1","ACPP","SLC45A3","STEAP2","SYP","CHGA","ENO2","NCAM1")
+
+admsc_sp <- ADMSC_SPECIFIC[ADMSC_SPECIFIC %in% rownames(norm_counts)]
+rv1_sp <- RV1_SPECIFIC[RV1_SPECIFIC %in% rownames(norm_counts)]
+
+rpmi <- list(
+  TNFRSF12A = c("HALLMARK_TNFA_SIGNALING_VIA_NFKB","HALLMARK_HYPOXIA","HALLMARK_COMPLEMENT",
+    "HALLMARK_INFLAMMATORY_RESPONSE","HALLMARK_APOPTOSIS"),
+  ITGA4 = c("HALLMARK_PI3K_AKT_MTOR_SIGNALING","HALLMARK_MTORC1_SIGNALING","HALLMARK_MYC_TARGETS_V1",
+    "HALLMARK_MYC_TARGETS_V2","HALLMARK_OXIDATIVE_PHOSPHORYLATION","HALLMARK_GLYCOLYSIS",
+    "HALLMARK_CHOLESTEROL_HOMEOSTASIS","HALLMARK_FATTY_ACID_METABOLISM","HALLMARK_ANDROGEN_RESPONSE",
+    "CUSTOM_HALLMARK_ANDROGEN_RESPONSE","HALLMARK_ADIPOGENESIS","CUSTOM_HALLMARK_ADIPOGENESIS",
+    "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY"),
+  SDC2 = c("HALLMARK_TGF_BETA_SIGNALING","HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"),
+  SDC4 = c("HALLMARK_PROTEIN_SECRETION","HALLMARK_UNFOLDED_PROTEIN_RESPONSE"),
+  LRP1 = c("HALLMARK_CHOLESTEROL_HOMEOSTASIS","HALLMARK_PI3K_AKT_MTOR_SIGNALING"))
+
+triangulation_results <- data.frame()
+for (cn in key_contrasts) {
+  fd <- as.data.frame(gsea_results_all[[cn]])
+  for (j in seq_len(nrow(fd))) {
+    pw <- fd$pathway[j]; padj <- fd$padj[j]; nes <- fd$NES[j]
+    if (is.na(padj) || padj >= 0.25) next
+    le <- fd$leadingEdge[[j]]
+    if (is.null(le) || length(le) == 0) next
+    nt <- length(le); na2 <- sum(le %in% admsc_sp); nr <- sum(le %in% rv1_sp)
+    pa <- round(100 * na2 / nt, 1); pr <- round(100 * nr / nt, 1)
+    src <- if (pa > 40) "ADMSC-dominated" else if (pr > 40) "Tumor-dominated" else
+      if (pa > 20 && pr > 20) "Mixed" else "Ambiguous"
+
+    am <- as.data.frame(gsea_results_adj[[cn]]); am <- am[am$pathway == pw, ]
+    ac <- nrow(am) > 0 && !is.na(am$padj) && am$padj < 0.25 && sign(am$NES) == sign(nes)
+    an <- if (nrow(am) > 0) am$NES else NA
+
+    rl <- FALSE; lr <- c()
+    for (rn in names(rpmi)) if (pw %in% rpmi[[rn]]) { rl <- TRUE; lr <- c(lr, rn) }
+
+    cs <- sum(c(TRUE, pr > pa, ac, rl, src != "ADMSC-dominated"))
+    cf <- if (cs >= 4) "High" else if (cs >= 3) "Medium" else "Low"
+
+    pd2 <- gsub("^HALLMARK_", "", pw); pd2 <- gsub("^CUSTOM_", "* ", pd2)
+    pd2 <- gsub("^GOBP_|^GOCC_|^GOMF_|^KEGG_|^REACTOME_|^WP_|^PID_|^BIOCARTA_", "", pd2)
+
+    triangulation_results <- rbind(triangulation_results, data.frame(
+      Contrast = cn, Pathway = pd2, Pathway_ID = pw, NES = round(nes, 3), padj = signif(padj, 3),
+      LE_total = nt, LE_ADMSC = na2, LE_22Rv1 = nr, Pct_ADMSC = pa, Pct_22Rv1 = pr,
+      Signal_source = src, Adj_concordant = ac, Adj_NES = round(an, 3),
+      Receptor_linked = rl, Linked_receptors = paste(lr, collapse = "; "),
+      Convergence_score = cs, Confidence = cf, stringsAsFactors = FALSE))
+  }
+}
+triangulation_results <- triangulation_results[
+  order(-match(triangulation_results$Confidence, c("High","Medium","Low")),
+        -triangulation_results$Convergence_score), ]
+write.csv(triangulation_results, file.path(TRIANG_DIR, "pathway_triangulation_results.csv"), row.names = FALSE)
+
+hc2 <- triangulation_results[triangulation_results$Confidence == "High", ]
+if (nrow(hc2) > 0) {
+  cat("   HIGH-CONFIDENCE:\n")
+  print(hc2[, c("Contrast","Pathway","NES","Signal_source","Linked_receptors","Convergence_score")], row.names = FALSE)
+}
+
+if (nrow(triangulation_results) > 0 && nrow(triangulation_results) <= 80) {
+  tw <- triangulation_results %>% select(Contrast, Pathway, Convergence_score) %>%
+    pivot_wider(names_from = Contrast, values_from = Convergence_score, values_fill = 0)
+  tm <- as.matrix(tw[, -1]); rownames(tm) <- tw$Pathway
+  if (nrow(tm) > 1) {
+    rownames(tm) <- make_unique_display_names(rownames(tm))
+    pdf(file.path(TRIANG_DIR, "convergence_heatmap.pdf"), width = 10, height = max(8, nrow(tm) * 0.3 + 2))
+    pheatmap(tm, cluster_cols = FALSE, cluster_rows = TRUE,
+      color = colorRampPalette(c("white","yellow","orange","red","darkred"))(6),
+      breaks = seq(-0.5, 5.5, by = 1), main = "Convergence Score",
+      fontsize_row = 7, display_numbers = TRUE, number_format = "%d")
+    dev.off()
+  }
+}
+cat("   Triangulation complete.\n\n")
+
+
+# ============================================================
+# 15. RECEPTOR-ANCHORED ANALYSIS (Level 3)
+# ============================================================
+
+cat(">> Step 15: Receptor-Anchored Analysis...\n\n")
+
+ANCHOR_DIR <- file.path(WORK_DIR, "09_Receptor_Anchored")
+dir.create(ANCHOR_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# --- Helper: fuzzy-match a pathway name in the GSEA results ---
+# The hardcoded "HALLMARK_*" names may not exactly match what fgsea stored
+# (e.g. fgsea uses data.table pathway column from all_gene_sets which may
+#  have been loaded under a slightly different name by msigdbr).
+# This function tries: exact match -> grep match -> NA.
+find_pathway_in_gsea <- function(pathway_id, gsea_df) {
+  # 1. Exact match
+  row <- gsea_df[gsea_df$pathway == pathway_id, ]
+  if (nrow(row) > 0) return(row[1, ])
+
+  # 2. Grep: extract the core name (strip HALLMARK_ prefix) and search
+  core <- gsub("^HALLMARK_", "", pathway_id)
+  candidates <- gsea_df$pathway[grepl(core, gsea_df$pathway, fixed = TRUE)]
+  if (length(candidates) > 0) {
+    row <- gsea_df[gsea_df$pathway == candidates[1], ]
+    if (nrow(row) > 0) return(row[1, ])
+  }
+
+  # 3. Not found — return single-row data.frame with NAs
+  return(data.frame(pathway = pathway_id, NES = NA_real_, padj = NA_real_,
+                    stringsAsFactors = FALSE))
+}
+
+# --- Helper: fuzzy-match receptor Comparison string ---
+# contrasts_list uses "sgTsgM_vs_SC" but receptor_stats$Comparison uses "sgT-sgM_vs_SC"
+normalize_comparison <- function(contrast_name) {
+  gsub("sgTsgM", "sgT-sgM", contrast_name)
+}
+
+rpe <- list(
+  TNFRSF12A = list(fn = "Fn14", lg = "TNFSF12", pw = list(
+    list(p = "HALLMARK_TNFA_SIGNALING_VIA_NFKB", m = "Fn14->NF-kB", e = "Direct"),
+    list(p = "HALLMARK_HYPOXIA", m = "NF-kB->HIF-1a", e = "Indirect"),
+    list(p = "HALLMARK_COMPLEMENT", m = "NF-kB->C3", e = "Indirect"),
+    list(p = "HALLMARK_INFLAMMATORY_RESPONSE", m = "NF-kB->cytokines", e = "Direct"),
+    list(p = "HALLMARK_APOPTOSIS", m = "caspases", e = "Direct"),
+    list(p = "HALLMARK_P53_PATHWAY", m = "NF-kB/AKT->p53", e = "Indirect"),
+    list(p = "HALLMARK_ANGIOGENESIS", m = "NF-kB->VEGF", e = "Indirect"))),
+  ITGA4 = list(fn = "Integrin a4", lg = "MDK", pw = list(
+    list(p = "HALLMARK_PI3K_AKT_MTOR_SIGNALING", m = "FAK->PI3K->AKT", e = "Direct"),
+    list(p = "HALLMARK_MTORC1_SIGNALING", m = "AKT->mTORC1", e = "Direct"),
+    list(p = "HALLMARK_MYC_TARGETS_V1", m = "AKT->MYC", e = "Indirect"),
+    list(p = "HALLMARK_MYC_TARGETS_V2", m = "AKT->MYC", e = "Indirect"),
+    list(p = "HALLMARK_OXIDATIVE_PHOSPHORYLATION", m = "mTORC1->mito", e = "Indirect"),
+    list(p = "HALLMARK_GLYCOLYSIS", m = "AKT->HIF-1a", e = "Indirect"),
+    list(p = "HALLMARK_CHOLESTEROL_HOMEOSTASIS", m = "mTORC1->SREBP", e = "Indirect"),
+    list(p = "HALLMARK_FATTY_ACID_METABOLISM", m = "mTORC1->SREBP1", e = "Indirect"),
+    list(p = "HALLMARK_ANDROGEN_RESPONSE", m = "AKT->AR", e = "Indirect"),
+    list(p = "HALLMARK_KRAS_SIGNALING_UP", m = "FAK->RAS", e = "Direct"))),
+  SDC2 = list(fn = "Syndecan-2", lg = "MDK", pw = list(
+    list(p = "HALLMARK_TGF_BETA_SIGNALING", m = "co-receptor", e = "Direct"),
+    list(p = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", m = "EMT", e = "Direct"))),
+  SDC4 = list(fn = "Syndecan-4", lg = "MDK+TNFSF12", pw = list(
+    list(p = "HALLMARK_PROTEIN_SECRETION", m = "trafficking", e = "Indirect"),
+    list(p = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", m = "ER stress", e = "Indirect"))),
+  LRP1 = list(fn = "LRP1", lg = "MDK", pw = list(
+    list(p = "HALLMARK_CHOLESTEROL_HOMEOSTASIS", m = "lipid uptake", e = "Direct"),
+    list(p = "HALLMARK_PI3K_AKT_MTOR_SIGNALING", m = "LRP1->PI3K", e = "Direct"))))
+
+# --- Diagnostic: check what pathway names actually exist in gsea_results_all ---
+cat("   Diagnosing pathway name matching...\n")
+all_gsea_pathways <- unique(unlist(lapply(gsea_results_all, function(x) as.data.frame(x)$pathway)))
+expected_hallmarks <- unique(unlist(lapply(rpe, function(r) sapply(r$pw, function(p) p$p))))
+for (eh in expected_hallmarks) {
+  exact <- eh %in% all_gsea_pathways
+  core  <- gsub("^HALLMARK_", "", eh)
+  fuzzy <- any(grepl(core, all_gsea_pathways, fixed = TRUE))
+  if (!exact && fuzzy) {
+    matched <- all_gsea_pathways[grepl(core, all_gsea_pathways, fixed = TRUE)][1]
+    cat(sprintf("     [REMAP] %s -> %s\n", eh, matched))
+  } else if (!exact && !fuzzy) {
+    cat(sprintf("     [MISSING] %s not found in GSEA results\n", eh))
+  }
+}
+cat("\n")
+
+anchor_results <- data.frame()
+for (rn in names(rpe)) {
+  ri <- rpe[[rn]]
+  for (pi in ri$pw) for (cn in key_contrasts) {
+    fd <- as.data.frame(gsea_results_all[[cn]])
+
+    # Use fuzzy matching instead of exact ==
+    gr <- find_pathway_in_gsea(pi$p, fd)
+    gn <- gr$NES[1]
+    gp <- gr$padj[1]
+
+    # Use normalized comparison string
+    comp_str <- normalize_comparison(cn)
+    rs <- receptor_stats %>% filter(Gene == rn & Comparison == comp_str)
+    rf <- if (nrow(rs) > 0) rs$FoldChange[1] else NA
+    rpv <- if (nrow(rs) > 0) rs$P_value[1] else NA
+    ra <- if (nrow(rs) > 0) rs$ANOVA_P[1] else NA
+
+    ps <- !is.na(gp) && gp < 0.25
+    rr <- !is.na(rf) && (rf > 1.1 | rf < 0.9)
+    ch <- ps && rr
+    sc <- sum(c(ps, rr, ch, !is.na(ra) && ra < 0.1))
+
+    anchor_results <- rbind(anchor_results, data.frame(
+      Contrast = cn, Receptor = rn, Receptor_fullname = ri$fn, Ligand = ri$lg,
+      Pathway = gsub("^HALLMARK_", "", pi$p), Pathway_ID = pi$p,
+      Mechanism = pi$m, Evidence = pi$e,
+      GSEA_NES = round(gn, 3), GSEA_padj = signif(gp, 3), Pathway_sig = ps,
+      Receptor_FC = round(rf, 3), Receptor_pval = signif(rpv, 3), Receptor_ANOVA = signif(ra, 3),
+      Receptor_responsive = rr, Mechanistic_coherence = ch, Support_score = sc,
+      stringsAsFactors = FALSE))
+  }
+}
+anchor_results <- anchor_results[order(-anchor_results$Support_score), ]
+write.csv(anchor_results, file.path(ANCHOR_DIR, "receptor_anchored_pathway_analysis.csv"), row.names = FALSE)
+
+# Summary stats
+n_with_nes <- sum(!is.na(anchor_results$GSEA_NES))
+n_sig_pw   <- sum(anchor_results$Pathway_sig)
+cat(sprintf("   Anchor results: %d rows, %d with NES, %d pathway-significant\n",
+            nrow(anchor_results), n_with_nes, n_sig_pw))
+
+ta <- head(anchor_results[anchor_results$Support_score >= 2, ], 20)
+if (nrow(ta) > 0) {
+  cat("   Top connections:\n")
+  print(ta[, c("Contrast","Receptor","Ligand","Pathway","GSEA_NES","Receptor_FC","Support_score")], row.names = FALSE)
+} else {
+  cat("   [NOTE] No connections with Support_score >= 2.\n")
+  cat("   Showing top 10 by Support_score:\n")
+  print(head(anchor_results[, c("Contrast","Receptor","Ligand","Pathway","GSEA_NES","Receptor_FC","Support_score")], 10),
+        row.names = FALSE)
+}
+
+receptor_summary <- data.frame()
+for (rn in names(rpe)) {
+  ra <- anchor_results[anchor_results$Receptor == rn, ]
+  rv <- unique(receptor_stats$ANOVA_P[receptor_stats$Gene == rn]); rv <- rv[!is.na(rv)][1]
+  receptor_summary <- rbind(receptor_summary, data.frame(
+    Receptor = rn, Full_name = rpe[[rn]]$fn, Ligand = rpe[[rn]]$lg,
+    N_sig = sum(ra$Pathway_sig), N_coherent = sum(ra$Mechanistic_coherence),
+    Mean_support = round(mean(ra$Support_score), 2), Max_support = max(ra$Support_score),
+    ANOVA_P = signif(rv, 4), stringsAsFactors = FALSE))
+}
+receptor_summary <- receptor_summary[order(-receptor_summary$Mean_support), ]
+write.csv(receptor_summary, file.path(ANCHOR_DIR, "receptor_ranking.csv"), row.names = FALSE)
+
+# --- Network export (with empty-data guard) ---
+sig_edges <- anchor_results[anchor_results$Pathway_sig, ]
+
+if (nrow(sig_edges) > 0) {
+  edges <- sig_edges[, c("Receptor","Pathway","Ligand","GSEA_NES","Support_score","Mechanism")]
+  colnames(edges) <- c("Source","Target","Ligand","NES","Weight","Interaction")
+  nodes <- rbind(
+    data.frame(Node = unique(edges$Source), Type = "Receptor", stringsAsFactors = FALSE),
+    data.frame(Node = unique(edges$Target), Type = "Pathway", stringsAsFactors = FALSE))
+  write.csv(edges, file.path(ANCHOR_DIR, "network_edges.csv"), row.names = FALSE)
+  write.csv(nodes, file.path(ANCHOR_DIR, "network_nodes.csv"), row.names = FALSE)
+  cat(sprintf("   Network: %d edges, %d nodes\n", nrow(edges), nrow(nodes)))
+} else {
+  cat("   [NOTE] No significant pathway-receptor edges. Network files not generated.\n")
+  cat("   This may mean the HALLMARK pathway names in GSEA results don't exactly match\n")
+  cat("   the hardcoded names. Check the [REMAP]/[MISSING] diagnostics above.\n")
+
+  # Fallback: export top connections by Support_score regardless of Pathway_sig
+  top_all <- head(anchor_results[order(-anchor_results$Support_score), ], 30)
+  if (nrow(top_all) > 0) {
+    edges_fb <- top_all[, c("Receptor","Pathway","Ligand","GSEA_NES","Support_score","Mechanism")]
+    colnames(edges_fb) <- c("Source","Target","Ligand","NES","Weight","Interaction")
+    nodes_fb <- rbind(
+      data.frame(Node = unique(edges_fb$Source), Type = "Receptor", stringsAsFactors = FALSE),
+      data.frame(Node = unique(edges_fb$Target), Type = "Pathway", stringsAsFactors = FALSE))
+    write.csv(edges_fb, file.path(ANCHOR_DIR, "network_edges_fallback.csv"), row.names = FALSE)
+    write.csv(nodes_fb, file.path(ANCHOR_DIR, "network_nodes_fallback.csv"), row.names = FALSE)
+    cat(sprintf("   Fallback network: %d edges, %d nodes (by Support_score)\n",
+                nrow(edges_fb), nrow(nodes_fb)))
+  }
+}
+cat("   Receptor-anchored analysis complete.\n\n")
+
+
+# ============================================================
+# 16. VALIDATION DESIGN (Level 4)
+# ============================================================
+
+cat(">> Step 16: Validation design...\n\n")
+
+VALID_DIR <- file.path(WORK_DIR, "10_Validation_Design")
+dir.create(VALID_DIR, recursive = TRUE, showWarnings = FALSE)
+
+validation_plan <- data.frame(Priority = 1:8,
+  Experiment = c("Conditioned Media RNA-seq","Receptor Blocking + RNA-seq","22Rv1 Monoculture RNA-seq",
+    "ADMSC Monoculture RNA-seq","Western Blot","scRNA-seq","Spatial Transcriptomics","Receptor KO in 22Rv1"),
+  Effort = c("Med","Med","Low","Low","Low","High","High","High"),
+  Cost = c("$$","$$","$","$","$","$$$","$$$$","$$$"),
+  Timeline = c("2-3wk","2-3wk","1-2wk","1-2wk","1wk","4-6wk","6-8wk","8-12wk"), stringsAsFactors = FALSE)
+write.csv(validation_plan, file.path(VALID_DIR, "validation_plan.csv"), row.names = FALSE)
+
+qpcr_panel <- data.frame(
+  Gene = c("TNFRSF12A","ITGA4","SDC2","SDC4","LRP1","TNFSF12","MDK",
+    "NFKB1","RELA","NFKBIA","TNFAIP3","CXCL8","IL6","HIF1A","VEGFA","LDHA","SLC2A1","CA9",
+    "AKT1","MTOR","RPS6KB1","EIF4EBP1","HK2","PKM","ACLY","FASN","HMGCR",
+    "AR","KLK3","NKX3-1","TMPRSS2","FKBP5","SYP","CHGA","ENO2","MYCN","EZH2","AURKA",
+    "CDH1","CDH2","VIM","SNAI1","TWIST1","ZEB1","GAPDH","ACTB","HPRT1"),
+  Category = c(rep("Receptor",5),rep("Ligand",2),rep("NF-kB",6),rep("Hypoxia",5),
+    rep("mTOR",4),rep("Metabolism",5),rep("AR",5),rep("NEPC",6),rep("EMT",6),rep("HK",3)),
+  stringsAsFactors = FALSE)
+write.csv(qpcr_panel, file.path(VALID_DIR, "qPCR_panel.csv"), row.names = FALSE)
+
+integrated_summary <- data.frame()
+for (cn in key_contrasts) {
+  ts <- triangulation_results[triangulation_results$Contrast == cn, ]
+  for (j in seq_len(nrow(ts))) {
+    pid <- ts$Pathway_ID[j]
+    as2 <- anchor_results[anchor_results$Contrast == cn & anchor_results$Pathway_ID == pid, ]
+    ms <- if (nrow(as2) > 0) max(as2$Support_score) else 0
+    br <- if (nrow(as2) > 0) as2$Receptor[which.max(as2$Support_score)] else "—"
+    cs2 <- ts$Convergence_score[j] + ms
+    oc <- if (cs2 >= 7) "Very High" else if (cs2 >= 5) "High" else if (cs2 >= 3) "Medium" else "Low"
+    integrated_summary <- rbind(integrated_summary, data.frame(
+      Contrast = cn, Pathway = ts$Pathway[j], GSEA_NES = ts$NES[j],
+      Signal_source = ts$Signal_source[j], Convergence = ts$Convergence_score[j],
+      Best_receptor = br, Anchor = ms, Combined = cs2, Confidence = oc, stringsAsFactors = FALSE))
+  }
+}
+integrated_summary <- integrated_summary[order(-integrated_summary$Combined), ]
+write.csv(integrated_summary, file.path(VALID_DIR, "integrated_confidence.csv"), row.names = FALSE)
+
+ti <- integrated_summary[integrated_summary$Confidence %in% c("Very High","High"), ]
+if (nrow(ti) > 0) {
+  cat("   TOP PATHWAYS:\n")
+  print(head(ti[, c("Contrast","Pathway","GSEA_NES","Best_receptor","Combined","Confidence")], 20), row.names = FALSE)
+}
+cat("\n")
+
+
+# ============================================================
+# 17. FINAL EXCEL + iCLOUD COPY
+# ============================================================
+
+cat(">> Step 17: Final export...\n")
+
+wb2 <- loadWorkbook(excel_on_ext)
+addWorksheet(wb2, "Cell_Composition"); writeData(wb2, "Cell_Composition", composition_df)
+ce <- concordance_results[concordance_results$Concordance != "NS_both", ]
+addWorksheet(wb2, "GSEA_Concordance"); writeData(wb2, "GSEA_Concordance", ce)
+addWorksheet(wb2, "Triangulation"); writeData(wb2, "Triangulation", triangulation_results)
+addWorksheet(wb2, "Receptor_Anchored"); writeData(wb2, "Receptor_Anchored", anchor_results)
+addWorksheet(wb2, "Receptor_Ranking"); writeData(wb2, "Receptor_Ranking", receptor_summary)
+addWorksheet(wb2, "Integrated"); writeData(wb2, "Integrated", integrated_summary)
+addWorksheet(wb2, "Validation_Plan"); writeData(wb2, "Validation_Plan", validation_plan)
+addWorksheet(wb2, "qPCR_Panel"); writeData(wb2, "qPCR_Panel", qpcr_panel)
+saveWorkbook(wb2, excel_on_ext, overwrite = TRUE)
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+for (d in c("02_counts","03_DEG","04_CellChat_receptors","05_GSEA_Hallmarks","06_QC",
+            "07_Deconvolution","08_Triangulation","09_Receptor_Anchored","10_Validation_Design")) {
+  src <- file.path(WORK_DIR, d); dst <- file.path(OUTPUT_DIR, d)
+  if (dir.exists(src)) {
+    dir.create(dst, recursive = TRUE, showWarnings = FALSE)
+    sf <- list.files(src, full.names = TRUE, recursive = TRUE)
+    for (f in sf) {
+      rp <- sub(paste0(src, "/"), "", f); df <- file.path(dst, rp)
+      dir.create(dirname(df), recursive = TRUE, showWarnings = FALSE)
+      file.copy(f, df, overwrite = TRUE)
+    }
+    cat(sprintf("   Copied %s/ (%d files)\n", d, length(sf)))
+  }
+}
+if (file.exists(excel_on_ext))
+  file.copy(excel_on_ext, file.path(OUTPUT_DIR, basename(excel_on_ext)), overwrite = TRUE)
+
+sink(file.path(OUTPUT_DIR, "session_info.txt"))
+cat("Run: ", as.character(Sys.time()), "\n\n")
+for (cn in names(gsea_collections)) cat(sprintf("  %s: %d\n", cn, length(gsea_collections[[cn]])))
+cat(sprintf("  Total: %d\n\n", length(all_gene_sets)))
+sessionInfo()
+sink()
+
+unlink(SYMLINK_EXT); unlink(SYMLINK_BASE, recursive = TRUE)
+
+cat("\n=============================================================\n")
+cat("  PIPELINE COMPLETE\n")
+cat("=============================================================\n\n")
+cat("Done!\n")
